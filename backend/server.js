@@ -314,7 +314,7 @@ app.get('/api/issues/:atomIssueId/playlist/:playlistId/context', async (req, res
         ...items[i], is_current: i === cur, is_asset_match: !!issue.asset_id && items[i].asset_id === issue.asset_id,
       })),
     });
-  } catch (e) { res.status(502).json({ error: e.message }); }
+  } catch (e) { res.status(e.status === 403 ? 403 : 502).json({ error: e.message }); }
 });
 
 // ── ATOM passthrough reads ────────────────────────────────────────────────────

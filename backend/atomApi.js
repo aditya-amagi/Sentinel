@@ -327,6 +327,18 @@ async function getIssueDetails(issue) {
 
 // ── Playlists ─────────────────────────────────────────────────────────────────
 
+// Some ATOM roles (e.g. prod `operator`) get 403 on playlist endpoints. After a 403, stop calling
+// them for a while instead of failing (slowly) on every feed/date in every sync.
+const FORBIDDEN_BACKOFF_MS = 6 * 3600e3;
+const forbiddenUntil = {}; // endpoint key → epoch ms
+function isForbidden(key) { return (forbiddenUntil[key] || 0) > Date.now(); }
+function markForbidden(key, err) {
+  if (err.status !== 403) return false;
+  if (!isForbidden(key)) console.warn(`[atom] ${key}: 403 Forbidden for this ATOM role — skipping it for 6h`);
+  forbiddenUntil[key] = Date.now() + FORBIDDEN_BACKOFF_MS;
+  return true;
+}
+
 /**
  * Published playlist version for a feed + date. ATOM exposes only the current published
  * playlist, so Sentinel builds the version timeline over successive syncs
@@ -337,7 +349,7 @@ async function getPlaylistTimeline(feed_code, playlist_date, region, automation_
   if (!client)   return mockTimeline(feed_code, playlist_date, region);
 
   automation_url = automation_url || automationUrlByFeed.get(feed_code);
-  if (!feed_code || !playlist_date || !automation_url) return [];
+  if (!feed_code || !playlist_date || !automation_url || isForbidden('published_playlist')) return [];
   try {
     const res = await atomGet('/cache/published_playlist', { automation_url, feed_code, playlist_date });
     const pl  = res.data?.playlist;
@@ -349,7 +361,7 @@ async function getPlaylistTimeline(feed_code, playlist_date, region, automation_
       region:       region || null,
     }];
   } catch (err) {
-    if (err.status !== 404) console.warn(`[atom] ${err.message}`);
+    if (!markForbidden('published_playlist', err) && err.status !== 404) console.warn(`[atom] ${err.message}`);
     return [];
   }
 }
@@ -362,6 +374,9 @@ async function getPlaylistTimeline(feed_code, playlist_date, region, automation_
 async function getPlaylist(automation_url, feed_code, playlist_date) {
   if (!IS_LIVE) return mockPlaylist(feed_code, playlist_date);
   if (!automation_url || !feed_code || !playlist_date) return null;
+  if (isForbidden('feed_playlist')) {
+    const e = new Error('Your ATOM role is not allowed to read playlists (403)'); e.status = 403; throw e;
+  }
   try {
     const res = await atomGet(
       `/customers/${encodeURIComponent(automation_url)}/feeds/${encodeURIComponent(feed_code)}/playlist`,
@@ -381,6 +396,7 @@ async function getPlaylist(automation_url, feed_code, playlist_date) {
     return { meta: body.meta || {}, playlist_id: pl.id != null ? String(pl.id) : null, items };
   } catch (err) {
     if (err.status === 404) return null;
+    if (markForbidden('feed_playlist', err)) { err.message = 'Your ATOM role is not allowed to read playlists (403)'; }
     throw err;
   }
 }

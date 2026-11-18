@@ -33,6 +33,13 @@ async function sync() {
     const catalog = await atomCatalog.syncCatalog(issues.map(i => i.automation_url));
     if (catalog.feeds) issues = atomApi.applyFeedInfo(issues, feedLookup);
 
+    // Only feeds/headends with ATOM monitoring switched on (unknown feeds are kept)
+    const fetchedIds = new Set(issues.map(i => i.id));
+    const before = issues.length;
+    issues = issues.filter(i => db.isAlertMonitored(i));
+    const skippedUnmonitored = before - issues.length;
+    const purged = atomApi.isLive() ? db.purgeUnmonitoredAlerts() : 0;
+
     const plSynced = new Set();
     const seen = new Set();
     let plLookups = 0;
@@ -88,14 +95,17 @@ async function sync() {
       );
     }
 
+    // Alerts skipped as unmonitored still exist in ATOM — don't resolution-check them
+    for (const id of fetchedIds) seen.add(id);
     const resolved = await detectResolved(seen, truncated);
 
     lastCounts = {
       issues: upserted, occurrences: occs, playlist_versions: plVers, resolved,
+      skipped_unmonitored: skippedUnmonitored, purged_unmonitored: purged,
       catalog_feeds: db.countAtomFeeds(), catalog_errors: catalog.errors.length, truncated,
     };
     lastSyncTime = new Date().toISOString(); lastSyncStatus = 'success';
-    console.log(`[sync] Done — issues:${upserted} occs:${occs} plVers:${plVers} resolved:${resolved} catalogFeeds:${lastCounts.catalog_feeds}${truncated ? ' (TRUNCATED)' : ''}`);
+    console.log(`[sync] Done — issues:${upserted} skippedUnmonitored:${skippedUnmonitored} purged:${purged} occs:${occs} plVers:${plVers} resolved:${resolved} catalogFeeds:${lastCounts.catalog_feeds}${truncated ? ' (TRUNCATED)' : ''}`);
   } catch (err) {
     lastSyncStatus='error'; lastSyncError=err.message;
     console.error('[sync] Failed:', err.message);

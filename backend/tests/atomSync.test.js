@@ -18,6 +18,13 @@ describe('ATOM sync → Sentinel', () => {
   before(async () => {
     fake = await startFakeAtom();
     fake.alerts.push(makeAlert(4, { type: 'tarang_media_seq_stall_alert', severity: 'critical', name: 'Media seq stall' }));
+    // Monitoring switch cases
+    fake.alerts.push(makeAlert(5, { custom: { feed_code: 'ABC_OFF', headend_code: 'off_001' } }));            // feed monitoring off
+    fake.alerts.push(makeAlert(6, { custom: { feed_code: 'ABC_MIXED', headend_code: 'mx_off' } }));           // its headend off
+    fake.alerts.push(makeAlert(7, { custom: { feed_code: 'ABC_MIXED', headend_code: 'mx_on' } }));            // its headend on
+    fake.alerts.push(makeAlert(8, { custom: { feed_code: 'ABC_MIXED', headend_code: undefined } }));          // no headend, feed has one on
+    fake.alerts.push(makeAlert(9, { custom: { automation_url: 'dataonly.amagi.tv', feed_code: 'DO_FEED' } })); // customer data_only
+    fake.alerts.push(makeAlert(10, { custom: { automation_url: 'unknown.amagi.tv', feed_code: 'UNKNOWN' } })); // not in catalog
     clean();
     Object.assign(process.env, { ATOM_BASE_URL: fake.baseUrl, ATOM_API_KEY: 'k', ATOM_PAGE_SIZE: '10', ATOM_MAX_PAGES: '5', ATOM_ALERT_TYPES: '*',
       DB_PATH: TEST_DB, NODE_ENV: 'test', SESSION_SECRET: 'x' });
@@ -35,7 +42,8 @@ describe('ATOM sync → Sentinel', () => {
   it('stores every alert with full ATOM fields', () => {
     const s = sync.getSyncStatus();
     assert.equal(s.lastSyncStatus, 'success', s.lastSyncError);
-    assert.equal(s.counts.issues, 4);
+    assert.equal(s.counts.issues, 7); // 1001–1004 + 1007, 1008 (monitored) + 1010 (unknown feed, fail open)
+    assert.equal(s.counts.skipped_unmonitored, 3);
     const r = db.getIssueByCompositeKey('1004', '230001').issue;
     assert.equal(r.issue_type, 'tarang_media_seq_stall_alert');
     assert.equal(r.severity, 'critical');
@@ -44,6 +52,29 @@ describe('ATOM sync → Sentinel', () => {
     assert.equal(r.duration_ms, 300000);
     assert.equal(r.consolidated_status, 'active');
     assert.equal(r.labels, '{"team":"toc"}');
+  });
+
+  it('only keeps alerts on feeds/headends with ATOM monitoring on', () => {
+    const has = id => !!db.getDb().prepare('SELECT 1 FROM issues WHERE atom_issue_id=?').get(id);
+    assert.equal(has('1005'), false, 'feed with monitoring off');
+    assert.equal(has('1006'), false, 'alert on a headend with monitoring off');
+    assert.equal(has('1007'), true,  'alert on a monitored headend');
+    assert.equal(has('1008'), true,  'no headend, feed has a monitored headend');
+    assert.equal(has('1009'), false, 'customer data_only');
+    assert.equal(has('1010'), true,  'feed not in catalog → shown (fail open)');
+    assert.equal(db.getAtomFeed('ABC_OFF').monitored, 0);
+    assert.equal(db.getAtomFeed('DO_FEED').data_only, 1);
+  });
+
+  it('purges untouched alerts when a feed is switched off, but keeps triaged ones', async () => {
+    db.updateIssue(db.getIssueByCompositeKey('1007', '230001').issue.id, { state: 'ack', acknowledged: 1 });
+    fake.customers['customer-abc.amagi.tv'].accounts[0].feeds[2].headends.forEach(h => { h.health.monitoring = false; });
+    db.getDb().prepare(`UPDATE atom_feeds SET synced_at = datetime('now','-1 day')`).run(); // force catalog refresh
+    await sync.triggerSync();
+    const has = id => !!db.getDb().prepare('SELECT 1 FROM issues WHERE atom_issue_id=?').get(id);
+    assert.equal(has('1008'), false, 'untriaged alert on now-unmonitored feed removed');
+    assert.equal(has('1007'), true, 'acked alert kept for the record');
+    fake.customers['customer-abc.amagi.tv'].accounts[0].feeds[2].headends[0].health.monitoring = true;
   });
 
   it('syncs the feed catalog and pre-fills the customer name', () => {

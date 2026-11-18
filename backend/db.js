@@ -888,22 +888,60 @@ function getAtomFeed(feed_code) {
 function upsertAtomFeed(f) {
   getDb().prepare(`
     INSERT INTO atom_feeds (feed_code, feed_name, automation_url, customer_name, amg_id, account_domain,
-      time_zone, broadcast_start_time, days_to_monitor, headends_json, synced_at)
+      time_zone, broadcast_start_time, days_to_monitor, headends_json, data_only, monitored, synced_at)
     VALUES (@feed_code, @feed_name, @automation_url, @customer_name, @amg_id, @account_domain,
-      @time_zone, @broadcast_start_time, @days_to_monitor, @headends_json, CURRENT_TIMESTAMP)
+      @time_zone, @broadcast_start_time, @days_to_monitor, @headends_json, @data_only, @monitored, CURRENT_TIMESTAMP)
     ON CONFLICT(feed_code) DO UPDATE SET
       feed_name = excluded.feed_name, automation_url = excluded.automation_url,
       customer_name = excluded.customer_name, amg_id = excluded.amg_id,
       account_domain = excluded.account_domain, time_zone = excluded.time_zone,
       broadcast_start_time = excluded.broadcast_start_time, days_to_monitor = excluded.days_to_monitor,
-      headends_json = excluded.headends_json, synced_at = CURRENT_TIMESTAMP
+      headends_json = excluded.headends_json, data_only = excluded.data_only,
+      monitored = excluded.monitored, synced_at = CURRENT_TIMESTAMP
   `).run({
     feed_code: f.feed_code, feed_name: f.feed_name ?? null, automation_url: f.automation_url ?? null,
     customer_name: f.customer_name ?? null, amg_id: f.amg_id ?? null, account_domain: f.account_domain ?? null,
     time_zone: f.time_zone ?? null, broadcast_start_time: f.broadcast_start_time ?? null,
     days_to_monitor: f.days_to_monitor ?? null,
     headends_json: f.headends ? JSON.stringify(f.headends) : null,
+    data_only: f.data_only ? 1 : 0,
+    monitored: f.monitored === undefined ? 1 : (f.monitored ? 1 : 0),
   });
+}
+
+/**
+ * Is this alert on a feed/headend that ATOM monitors?
+ * Unknown feed (not in catalog) → true (fail open). Customer data_only → false.
+ * Alert names a headend whose monitoring is off → false. Feed with no monitored headend → false.
+ */
+function isAlertMonitored(issue) {
+  const feed = getAtomFeed(issue.feed_code);
+  if (!feed) return true;
+  if (feed.data_only) return false;
+  if (issue.headend_code) {
+    const h = (feed.headends || []).find(x => x.code === issue.headend_code);
+    if (h && h.health && h.health.monitoring === false) return false;
+  }
+  return feed.monitored !== 0;
+}
+
+/**
+ * Remove untouched (Penalty, never ticketed) ATOM alerts on feeds now known to be unmonitored.
+ * Rows someone triaged or ticketed are kept for the record.
+ */
+function purgeUnmonitoredAlerts() {
+  const db = getDb();
+  const ids = db.prepare(`
+    SELECT i.atom_issue_id, i.playlist_id FROM issues i
+    JOIN atom_feeds f ON f.feed_code = i.feed_code
+    WHERE i.raw_type IS NOT NULL AND COALESCE(i.state,'penalty') = 'penalty'
+      AND (i.ticket_id IS NULL OR i.ticket_id = '')
+      AND (f.monitored = 0 OR f.data_only = 1)
+  `).all();
+  const delOcc = db.prepare(`DELETE FROM occurrences WHERE atom_issue_id=? AND playlist_id=?`);
+  const delIss = db.prepare(`DELETE FROM issues WHERE atom_issue_id=? AND playlist_id=?`);
+  db.transaction(() => { for (const r of ids) { delOcc.run(r.atom_issue_id, r.playlist_id); delIss.run(r.atom_issue_id, r.playlist_id); } })();
+  return ids.length;
 }
 
 /** automation_urls seen on issues whose catalog entry is missing or older than maxAgeHours. */
@@ -1016,5 +1054,7 @@ module.exports = Object.assign(module.exports || {}, {
   getStaleAutomationUrls,
   automationSyncedWithin,
   countAtomFeeds,
+  isAlertMonitored,
+  purgeUnmonitoredAlerts,
   prefillCustomerName,
 });

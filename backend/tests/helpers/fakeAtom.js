@@ -56,9 +56,23 @@ function startFakeAtom() {
           feeds: [{
             code: 'AMG01579C1', name: 'ABC Movies HD', time_zone: 'Asia/Kolkata',
             broadcast_start_time: '06:00:00', days_to_monitor: 3,
-            headends: [{ code: 'fa_001', name: 'Primary', active: true, health: { playback: 'ok', monitoring: 'ok' } }],
+            headends: [{ code: 'fa_001', name: 'Primary', active: true, health: { playback: 'ok', monitoring: true } }],
+          }, {
+            code: 'ABC_OFF', name: 'ABC Unmonitored', time_zone: 'Asia/Kolkata', broadcast_start_time: '06:00:00',
+            headends: [{ code: 'off_001', name: 'Primary', active: true, health: { monitoring: false } }],
+          }, {
+            code: 'ABC_MIXED', name: 'ABC Mixed', time_zone: 'Asia/Kolkata',
+            headends: [
+              { code: 'mx_on',  name: 'Main',   active: true,  health: { monitoring: true } },
+              { code: 'mx_off', name: 'Backup', active: false, health: { monitoring: false } },
+            ],
           }],
         }],
+      },
+      'dataonly.amagi.tv': {
+        name: 'Metadata Only Co', url: 'dataonly.amagi.tv', data_only: true,
+        accounts: [{ amg_id: 'amg-1', domain: 'do', automation_url: 'dataonly.amagi.tv',
+          feeds: [{ code: 'DO_FEED', name: 'DO Feed', headends: [{ code: 'do_1', health: { monitoring: true } }] }] }],
       },
     },
     playlist: {
