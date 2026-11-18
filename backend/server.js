@@ -33,7 +33,8 @@ const PORT = process.env.PORT || 3001;
 let sessionStore;
 try {
   const SQLiteStore = require('connect-sqlite3')(session);
-  sessionStore = new SQLiteStore({ db: 'sessions.db', dir: path.join(__dirname) });
+  // SESSION_DB_DIR lets Docker keep login sessions on the data volume
+  sessionStore = new SQLiteStore({ db: 'sessions.db', dir: process.env.SESSION_DB_DIR || path.join(__dirname) });
 } catch {
   console.warn('[server] connect-sqlite3 not available — using in-memory session store');
 }

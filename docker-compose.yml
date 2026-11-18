@@ -1,34 +1,36 @@
-version: '3.8'
-
 services:
   backend:
     build:
       context: ./backend
-      dockerfile: Dockerfile
     ports:
       - "3001:3001"
+    # All settings (ATOM token, Freshdesk, SESSION_SECRET, …) come from backend/.env at runtime —
+    # it is never copied into the image (see backend/.dockerignore).
+    env_file:
+      - ./backend/.env
+    environment:
+      # Container-specific overrides only (these win over backend/.env)
+      PORT: "3001"
+      DB_PATH: /app/data/atom_dashboard.db
+      SESSION_DB_DIR: /app/data
+      # Rotated ATOM refresh tokens must survive container restarts
+      ATOM_SESSION_FILE: /app/data/.atom_session.json
     volumes:
       - ./backend/data:/app/data
-    environment:
-      - PORT=3001
-      - ATOM_BASE_URL=${ATOM_BASE_URL:-}
-      - ATOM_API_KEY=${ATOM_API_KEY:-}
-      - ATOM_REFRESH_TOKEN=${ATOM_REFRESH_TOKEN:-}
-      - ATOM_BEARER_TOKEN=${ATOM_BEARER_TOKEN:-}
-      # Rotated refresh tokens must survive container restarts → keep the session on the volume
-      - ATOM_SESSION_FILE=/app/data/.atom_session.json
-      - DB_PATH=/app/data/atom_dashboard.db
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3001/healthz/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     restart: unless-stopped
 
   frontend:
     build:
       context: ./frontend
-      dockerfile: Dockerfile
     ports:
       - "3000:80"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     restart: unless-stopped
-
-volumes:
-  db_data:

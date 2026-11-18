@@ -45,3 +45,4 @@ backend/.atom_session.json
 backend/data/.atom_session.json
 backend/sessions.db
 backend/.env.old
+backend/data/

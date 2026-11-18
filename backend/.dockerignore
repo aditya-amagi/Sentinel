@@ -1,0 +1,15 @@
+# Never bake secrets, local state or host-built modules into the image
+node_modules
+npm-debug.log*
+.env
+.env.*
+!.env.example
+*.db
+*.db-wal
+*.db-shm
+.atom_session.json
+data
+tests
+coverage
+Dockerfile
+.dockerignore

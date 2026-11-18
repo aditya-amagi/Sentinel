@@ -83,8 +83,16 @@ npm run demo
 ### 3. Docker Deployment
 
 ```bash
-docker-compose up --build -d
+cp backend/.env.example backend/.env   # then paste the ATOM token / Freshdesk key into it
+docker compose up --build -d
 ```
+`backend/.env` is read at runtime (`env_file`) and is never copied into the image. The database,
+login sessions and the rotating ATOM session live in `backend/data/` (mounted volume).
+
+> **Cloudflare WARP on your laptop?** WARP captures Docker's 172.x networks, so containers get no
+> DNS/internet and published ports don't answer. Exclude `172.16.0.0/12` in WARP's split tunnel
+> (Zero Trust admin, or `warp-cli tunnel ip add 172.16.0.0/12` if allowed), or pause WARP while
+> using Docker. Servers without WARP are unaffected.
 Frontend runs on `http://localhost:3000` (Nginx), Backend on `http://localhost:3001`.
 
 ---

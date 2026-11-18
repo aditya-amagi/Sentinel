@@ -152,7 +152,7 @@ async function refreshSso() {
       return sso.token;
     } catch (err) {
       const status = err.response?.status;
-      const msg = err.response?.data?.error || err.message;
+      const msg = err.response?.data?.error || err.message || err.code || 'network error';
       authState.lastError = `Token refresh failed${status ? ` (${status})` : ''}: ${msg}. Copy a fresh refresh token from the ATOM web app into ATOM_REFRESH_TOKEN.`;
       throw new Error(authState.lastError);
     } finally {
@@ -217,7 +217,8 @@ const atomGet = (path, params) => atomRequest('get', path, { params });
 function describeError(err, method, path) {
   const status = err.response?.status;
   const body   = err.response?.data;
-  const msg    = body?.error || body?.message || err.message;
+  // Network failures (DNS, timeouts) can have an empty message — fall back to the error code
+  const msg    = body?.error || body?.message || err.message || err.code || 'network error';
   const e = new Error(`ATOM ${method.toUpperCase()} ${path} failed${status ? ` (${status})` : ''}: ${msg}`);
   e.status = status;
   return e;
