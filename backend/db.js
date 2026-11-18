@@ -1,5 +1,6 @@
 const AT = require('./alertTypes');
 const TZ = require('./atomTime');
+const TT = require('./ticketText');
 const { applyMigrations } = require('./migrator');
 // db.js — SQLite with playlist-scoped occurrences + ticket warning system
 const Database = require('better-sqlite3');
@@ -136,6 +137,7 @@ const ATOM_COLS = [
   'headend_code','dedup_key','correlation_id','duration_ms','snoozed_until','snoozed_by',
   'resolved_at','resolved_by','atom_updated_at','labels','custom_details',
   'feed_name','amg_id','source_url',
+  'atom_view_ids','atom_view_names','view_group','view_family',
 ];
 
 function upsertIssue(issue) {
@@ -504,7 +506,9 @@ function getIssues(filters = {}) {
 }
 
 function applyFilters(filters, _q, _p, push) {
-  if (filters.region)       push(` AND i.region=?`,               [filters.region]);
+  if (filters.region)       push(` AND i.region=? COLLATE NOCASE`, [filters.region]);
+  if (filters.view_family)  push(` AND i.view_family=? COLLATE NOCASE`, [filters.view_family]);
+  if (filters.view_id)      push(` AND i.atom_view_ids LIKE ?`, [`%,${Number(filters.view_id)},%`]);
   if (filters.feed_code)    push(` AND i.feed_code LIKE ?`,        [`%${filters.feed_code}%`]);
   if (filters.issue_type)   push(` AND i.issue_type=?`,            [filters.issue_type]);
   if (filters.playlist_id)  push(` AND i.playlist_id=?`,           [filters.playlist_id]);
@@ -563,12 +567,12 @@ function getOtherIssueTypes() {
   `).all(...AT.ALERT_KEYS).map(r => ({ ...r, label: AT.label(r.key) }));
 }
 function getDistinctRegions() {
-  return getDb().prepare(`SELECT DISTINCT region FROM issues WHERE region IS NOT NULL ORDER BY region`).all().map(r => r.region);
+  return getDb().prepare(`SELECT DISTINCT region FROM issues WHERE region IS NOT NULL ORDER BY region COLLATE NOCASE`).all().map(r => r.region);
 }
 
 function getStats(region) {
   const db = getDb();
-  const w  = region ? `AND region='${region.replace(/'/g,"''")}'` : '';
+  const w  = region ? `AND region='${region.replace(/'/g,"''")}' COLLATE NOCASE` : '';
   const now = new Date().toISOString();
   return {
     total:     db.prepare(`SELECT COUNT(*) as c FROM issues WHERE 1=1 ${w}`).get().c,
@@ -791,8 +795,6 @@ function buildSubject(issue_type, feed_code, playlist_date) {
 
 // ── Description generation ────────────────────────────────────────────────────
 
-const esc = v => String(v).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-const utcLabel = iso => { const ms = Date.parse(iso); return Number.isFinite(ms) ? new Date(ms).toISOString().replace('T', ' ').replace(/\.\d+Z$|Z$/, ' UTC') : null; };
 
 function fmtDuration(ms) {
   if (ms == null || ms === '') return null;
@@ -803,48 +805,11 @@ function fmtDuration(ms) {
   return [h && `${h}h`, m && `${m}m`, (r || (!h && !m)) && `${r}s`].filter(Boolean).join(' ');
 }
 
-const SEVERITY_LABEL = { blocker: 'Blocker', critical: 'Critical', major: 'Major', minor: 'Minor', dev: 'Dev' };
 
+/** Ticket HTML (see ticketText.js). Kept for compatibility; buildFreshdeskPayload is the main entry. */
 function buildDescription(issue, customer_name) {
-  const feed  = issue.feed_code ? getAtomFeed(issue.feed_code) : null;
-  const start = issue.earliest_scheduled || issue.playlist_start_time;
-  const local = start && feed?.time_zone ? TZ.formatLocal(start, feed.time_zone) : null;
-
-  const rows = [
-    ['Feed',          (feed?.feed_name || issue.feed_name) ? `${issue.feed_code} (${feed?.feed_name || issue.feed_name})` : (issue.feed_code || '—')],
-    ['AMG ID',        issue.amg_id],
-    ['Issue Type',    friendlyIssueType(issue.issue_type) || '—'],
-    ['Alert',         issue.alert_name],
-    ['Severity',      SEVERITY_LABEL[issue.severity] || issue.severity],
-    ['Details',       issue.description],
-    ['Asset ID',      issue.asset_id     || '—'],
-    ['Playlist ID',   issue.playlist_id  || '—'],
-    ['Playlist Date', issue.playlist_date|| '—'],
-    ['Start Time',    issue.playlist_start_time ? utcLabel(issue.playlist_start_time) : '—'],
-    ['Issue Start',   start && issue.earliest_scheduled ? [utcLabel(start), local].filter(Boolean).join(' / ') : null],
-    ['Duration',      fmtDuration(issue.duration_ms)],
-    ['Headend',       issue.headend_code],
-    ['Automation',    issue.automation_url],
-    ['Customer',      customer_name || feed?.customer_name],
-    ['ATOM Alert ID', issue.atom_issue_id],
-    ['Link',          issue.source_url],
-  ].filter(([, v]) => v != null && v !== '');
-
-  const table = [
-    '<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-family:monospace;font-size:13px;">',
-    '<tr style="background:#f5f5f5;"><th>Field</th><th>Value</th></tr>',
-    ...rows.map(([f, v]) => `<tr><td><b>${f}</b></td><td>${esc(v)}</td></tr>`),
-    '</table>',
-  ].join('\n');
-
-  const greetName = customer_name || feed?.customer_name;
-  const intro = greetName
-    ? `<p>Dear ${esc(greetName)} Team,</p><p>We have detected the following alert in your playout system. Please review the details below and take necessary action.</p>`
-    : `<p>The following alert has been detected in the playout system. Please review and take necessary action.</p>`;
-
-  const footer = `<p>Please do not hesitate to reach out if you need further assistance.</p><p>Regards,<br/>Amagi TOC Team</p>`;
-
-  return `${intro}\n${table}\n${footer}`;
+  const feed = issue.feed_code ? getAtomFeed(issue.feed_code) : null;
+  return TT.buildTicket({ issue, feed, contacts: { customer_name }, ticketType: 'customer' }).html;
 }
 
 // Freshdesk priority: 1 Low, 2 Medium, 3 High, 4 Urgent
@@ -853,25 +818,61 @@ function priorityForSeverity(sev) { return SEVERITY_PRIORITY[sev] || 2; }
 
 // ── Freshdesk payload builder ─────────────────────────────────────────────────
 
-function buildFreshdeskPayload(issue, ticket_type) {
+/**
+ * Other open alerts of the same type on the same feed and broadcast day that are not yet
+ * ticketed — one ticket covers them all (e.g. several hole timings on one playlist).
+ */
+function getRelatedOpenAlerts(issue) {
+  if (!issue?.atom_issue_id || !issue.feed_code || !issue.issue_type || !issue.playlist_date) return [];
+  return getDb().prepare(`
+    SELECT * FROM issues
+    WHERE feed_code = ? AND issue_type = ? AND playlist_date = ?
+      AND NOT (atom_issue_id = ? AND playlist_id = ?)
+      AND (consolidated_status IS NULL OR consolidated_status != 'resolved')
+      AND COALESCE(state, 'penalty') != 'ticketed'
+    ORDER BY COALESCE(earliest_scheduled, playlist_start_time) ASC
+    LIMIT 50
+  `).all(issue.feed_code, issue.issue_type, issue.playlist_date, issue.atom_issue_id, issue.playlist_id);
+}
+
+function buildFreshdeskPayload(issue, ticket_type, { now } = {}) {
   const contacts = resolveContacts(issue.feed_code, issue.issue_type, ticket_type);
-  const subject  = buildSubject(issue.issue_type, issue.feed_code, issue.playlist_date);
-  const desc     = buildDescription(issue, contacts.customer_name);
+  const feed     = issue.feed_code ? getAtomFeed(issue.feed_code) : null;
+  const related  = getRelatedOpenAlerts(issue);
+  const t = TT.buildTicket({ issue, related, feed, contacts, ticketType: ticket_type, now });
 
   return {
     email:         contacts.contact_email,
-    subject,
-    description:   desc,
-    priority:      priorityForSeverity(issue.severity),
+    subject:       t.subject,
+    description:   t.html,
+    priority:      t.priority,
     status:        2,
     cc_emails:     contacts.cc_emails,
     custom_fields: {
       customer_name:   contacts.customer_name   || undefined,
       product_version: contacts.product_version || undefined,
     },
-    _meta: { contacts, subject, ticket_type },
+    _meta: {
+      contacts, subject: t.subject, ticket_type, priority_reason: t.priorityReason,
+      covers: t.items.map(i => ({ atom_issue_id: i.atom_issue_id, playlist_id: i.playlist_id })),
+    },
   };
 }
+
+/** Most recent original (non-follow-up) Freshdesk ticket for an issue — the follow-up parent. */
+function getParentTicket(atom_issue_id, playlist_id) {
+  return getDb().prepare(`
+    SELECT * FROM freshdesk_tickets
+    WHERE atom_issue_id = ? AND playlist_id = ? AND ticket_type != 'followup' AND freshdesk_id IS NOT NULL
+    ORDER BY created_at DESC, id DESC LIMIT 1
+  `).get(atom_issue_id, playlist_id) || null;
+}
+
+function countFollowups(freshdesk_id) {
+  return getDb().prepare(`SELECT COUNT(*) AS c FROM freshdesk_tickets WHERE freshdesk_id = ? AND ticket_type = 'followup'`).get(freshdesk_id).c;
+}
+
+// ── Freshdesk ticket storage ──────────────────────────────────────────────────
 
 // ══════════════════════════════════════════════════════════════════════════════
 // ATOM FEED CATALOG (atom_feeds, migration 004)
@@ -957,6 +958,77 @@ function getStaleAutomationUrls(maxAgeHours) {
   `).all(`-${Number(maxAgeHours) || 6} hours`).map(r => r.url);
 }
 
+// ── ATOM saved views ──────────────────────────────────────────────────────────
+
+function saveAtomViews(views) {
+  const db = getDb();
+  const up = db.prepare(`
+    INSERT INTO atom_views (id, name, grp, family, selected, synced_at) VALUES (@id, @name, @group, @family, @selected, CURRENT_TIMESTAMP)
+    ON CONFLICT(id) DO UPDATE SET name=excluded.name, grp=excluded.grp, family=excluded.family,
+      selected=excluded.selected, synced_at=CURRENT_TIMESTAMP`);
+  db.transaction(() => {
+    db.prepare(`UPDATE atom_views SET selected = 0`).run();
+    for (const v of views) up.run({ id: v.id, name: v.name, group: v.group || null, family: v.family || null, selected: v.selected ? 1 : 0 });
+  })();
+}
+
+/**
+ * Sidebar data: selected views grouped, each with open / needs-action counts.
+ * → [{group, open, penalty, views:[{id, name, family, open, penalty}]}]
+ */
+function getViewSummary() {
+  const db = getDb();
+  const views = db.prepare(`SELECT id, name, grp, family FROM atom_views WHERE selected = 1 ORDER BY grp COLLATE NOCASE, family`).all();
+  if (!views.length) return [];
+  const count = db.prepare(`
+    SELECT COUNT(*) AS open, SUM(CASE WHEN COALESCE(state,'penalty')='penalty' THEN 1 ELSE 0 END) AS penalty
+    FROM issues WHERE atom_view_ids LIKE ? AND (consolidated_status IS NULL OR consolidated_status != 'resolved')`);
+  const groups = new Map();
+  for (const v of views) {
+    const c = count.get(`%,${v.id},%`);
+    const row = { id: v.id, name: v.name, family: v.family, open: c.open || 0, penalty: c.penalty || 0 };
+    if (!groups.has(v.grp)) groups.set(v.grp, { group: v.grp, open: 0, penalty: 0, views: [] });
+    const g = groups.get(v.grp);
+    g.views.push(row);
+  }
+  // Group totals count each alert once (an alert can sit in several views of a group)
+  const gcount = db.prepare(`
+    SELECT COUNT(*) AS open, SUM(CASE WHEN COALESCE(state,'penalty')='penalty' THEN 1 ELSE 0 END) AS penalty
+    FROM issues WHERE view_group = ? COLLATE NOCASE AND (consolidated_status IS NULL OR consolidated_status != 'resolved')`);
+  for (const g of groups.values()) { const c = gcount.get(g.group); g.open = c.open || 0; g.penalty = c.penalty || 0; }
+  return [...groups.values()];
+}
+
+/**
+ * Views mode: after a complete fetch, remove untouched ATOM alerts (Penalty, never ticketed) that
+ * are in no selected view any more — resolved, or now matched by a view's ignore rule.
+ * Triaged/ticketed rows stay; resolution detection updates them.
+ */
+function purgeUntouchedNotIn(keepIds, protectViewIds = []) {
+  const db = getDb();
+  db.exec(`CREATE TEMP TABLE IF NOT EXISTS _keep_ids (id TEXT PRIMARY KEY)`);
+  db.exec(`DELETE FROM _keep_ids`);
+  const ins = db.prepare(`INSERT OR IGNORE INTO _keep_ids (id) VALUES (?)`);
+  return db.transaction(() => {
+    for (const id of keepIds) ins.run(String(id));
+    // Alerts last seen in a view that failed this sync are kept (we could not check them)
+    const protect = protectViewIds.map(id => ` AND COALESCE(atom_view_ids,'') NOT LIKE '%,${Number(id)},%'`).join('');
+    const where = `raw_type IS NOT NULL AND COALESCE(state,'penalty') = 'penalty'
+      AND (ticket_id IS NULL OR ticket_id = '') AND atom_issue_id NOT IN (SELECT id FROM _keep_ids)${protect}`;
+    db.prepare(`DELETE FROM occurrences WHERE atom_issue_id IN (SELECT atom_issue_id FROM issues WHERE ${where})`).run();
+    return db.prepare(`DELETE FROM issues WHERE ${where}`).run().changes;
+  })();
+}
+
+function getMeta(key) {
+  const r = getDb().prepare(`SELECT value FROM app_meta WHERE key = ?`).get(key);
+  return r ? r.value : null;
+}
+function setMeta(key, value) {
+  getDb().prepare(`INSERT INTO app_meta (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP`).run(key, value == null ? null : String(value));
+}
+
 /** True when the catalog for this automation was synced within maxAgeHours. */
 function automationSyncedWithin(automation_url, maxAgeHours) {
   return !!getDb().prepare(`
@@ -981,8 +1053,6 @@ function prefillCustomerName(feed_code, customer_name) {
   return r.changes > 0;
 }
 
-// ── Freshdesk ticket storage ──────────────────────────────────────────────────
-
 function storeFreshdeskTicket({ atom_issue_id, playlist_id, feed_code, issue_type, asset_id,
   freshdesk_id, ticket_number, ticket_url, ticket_type, subject, requester_email }) {
   const db = getDb();
@@ -1005,10 +1075,11 @@ function storeFreshdeskTicket({ atom_issue_id, playlist_id, feed_code, issue_typ
       ticket_url        = ?,
       ticket_created_at = CURRENT_TIMESTAMP,
       freshdesk_id      = ?,
+      state             = CASE WHEN ? = 'followup' THEN state ELSE 'ticketed' END,
       updated_at        = CURRENT_TIMESTAMP
     WHERE atom_issue_id = ? AND playlist_id = ?
   `).run(ticket_number || String(freshdesk_id || ''), ticket_url || null,
-         ticket_type, ticket_url || null, freshdesk_id || null,
+         ticket_type, ticket_url || null, freshdesk_id || null, ticket_type,
          atom_issue_id, playlist_id);
 
   return db.prepare(`SELECT * FROM freshdesk_tickets WHERE id = last_insert_rowid()`).get();
@@ -1049,6 +1120,9 @@ module.exports = Object.assign(module.exports || {}, {
   ISSUE_TYPE_FRIENDLY,
   priorityForSeverity,
   fmtDuration,
+  getRelatedOpenAlerts,
+  getParentTicket,
+  countFollowups,
   getAtomFeed,
   upsertAtomFeed,
   getStaleAutomationUrls,
@@ -1056,5 +1130,10 @@ module.exports = Object.assign(module.exports || {}, {
   countAtomFeeds,
   isAlertMonitored,
   purgeUnmonitoredAlerts,
+  saveAtomViews,
+  getViewSummary,
+  getMeta,
+  setMeta,
+  purgeUntouchedNotIn,
   prefillCustomerName,
 });

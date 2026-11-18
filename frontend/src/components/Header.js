@@ -10,7 +10,7 @@ const PAGE_TITLES = {
   settings:  'Contacts & feeds',
 };
 
-export default function Header({ stats, onSync, syncing, region, page, user, onLogout }) {
+export default function Header({ stats, onSync, syncing, region, family, page, user, onLogout }) {
   const { demo_mode } = useAppConfig();
   const s    = stats || {};
   const sync = s.sync || {};
@@ -25,7 +25,7 @@ export default function Header({ stats, onSync, syncing, region, page, user, onL
         <span className="tb-name">Sentinel</span>
         <span className="tb-divider" />
         <span className="tb-crumb">{PAGE_TITLES[page] || 'Sentinel'}</span>
-        {region && page !== 'settings' && <span className="tb-region">{region}</span>}
+        {region && page !== 'settings' && <span className="tb-region">{region}{family ? ` · ${family}` : ''}</span>}
         {demo_mode && <span className="tb-demo">Demo data</span>}
       </div>
 

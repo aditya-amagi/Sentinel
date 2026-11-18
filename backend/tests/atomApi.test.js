@@ -1,5 +1,9 @@
 'use strict';
 
+// Tests talk to a local fake ATOM: lift the production rate cap so they run instantly
+process.env.ATOM_MAX_REQUESTS_PER_MIN = '100000';
+process.env.ATOM_MAX_CONCURRENCY = '8';
+
 // atomApi.js against a fake ATOM (read paths; write-back OFF).
 
 const { describe, it, before, after } = require('node:test');

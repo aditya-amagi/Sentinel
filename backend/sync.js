@@ -3,11 +3,14 @@ const atomApi     = require('./atomApi');
 const atomCatalog = require('./atomCatalog');
 const db          = require('./db');
 
+// Load budgets (ATOM went down under ~4k requests in 2 h — keep these conservative).
+// The global rate cap in atomApi (ATOM_MAX_REQUESTS_PER_MIN, default 20) applies on top.
+const SYNC_INTERVAL_MIN = Math.min(60, Math.max(5, Number(process.env.ATOM_SYNC_INTERVAL_MIN) || 10));
 // GET /alerts/{id} checks per sync for alerts that dropped out of the fetch (oldest first)
-const RESOLVE_CHECK_LIMIT = Number(process.env.ATOM_RESOLVE_CHECKS_PER_SYNC) || 200;
-const RESOLVE_CONCURRENCY = 8;
+const RESOLVE_CHECK_LIMIT = Number(process.env.ATOM_RESOLVE_CHECKS_PER_SYNC) || 25;
+const RESOLVE_CONCURRENCY = 1;
 // Published-playlist lookups: at most N per sync, and each feed+date at most every 30 minutes
-const PLAYLIST_LOOKUPS_PER_SYNC = Number(process.env.ATOM_PLAYLIST_LOOKUPS_PER_SYNC) || 150;
+const PLAYLIST_LOOKUPS_PER_SYNC = Number(process.env.ATOM_PLAYLIST_LOOKUPS_PER_SYNC) || 20;
 const PLAYLIST_LOOKUP_TTL_MS = 30 * 60 * 1000;
 const playlistLookedUp = new Map(); // feed__date → last lookup ms
 
@@ -22,23 +25,36 @@ async function sync() {
     return;
   }
   if (isSyncing) return;
+  if (atomApi.isPaused()) {
+    lastSyncStatus = 'paused'; lastSyncError = atomApi.rateInfo().pause_reason;
+    console.warn('[sync] skipped — ATOM calls are paused by the circuit breaker');
+    return;
+  }
   isSyncing = true; lastSyncStatus = 'running'; lastSyncError = null;
   console.log(`[sync] Start ${new Date().toISOString()}`);
   try {
     const feedLookup = fc => db.getAtomFeed(fc);
-    let { issues, truncated } = await atomApi.fetchAlerts({ feedLookup });
+    let { issues, truncated, mode, viewErrors, failedViewIds = [] } = await atomApi.fetchAlerts({ feedLookup });
+    const viewsMode = mode === 'views';
+    if (viewsMode) db.saveAtomViews(atomApi.getViewList());
 
     // Refresh the feed catalog for automations on these alerts, then re-derive
     // region / broadcast date with the feeds' real timezones.
     const catalog = await atomCatalog.syncCatalog(issues.map(i => i.automation_url));
     if (catalog.feeds) issues = atomApi.applyFeedInfo(issues, feedLookup);
 
-    // Only feeds/headends with ATOM monitoring switched on (unknown feeds are kept)
+    // Scope. Views mode: the views (with ATOM's ignore rules) define what is in scope, so alerts that
+    // left every view are purged (if untouched). Type mode: keep only monitored feeds/headends.
     const fetchedIds = new Set(issues.map(i => i.id));
-    const before = issues.length;
-    issues = issues.filter(i => db.isAlertMonitored(i));
-    const skippedUnmonitored = before - issues.length;
-    const purged = atomApi.isLive() ? db.purgeUnmonitoredAlerts() : 0;
+    let skippedUnmonitored = 0, purged = 0;
+    if (viewsMode) {
+      if (!truncated) purged = db.purgeUntouchedNotIn(fetchedIds, failedViewIds);
+    } else {
+      const before = issues.length;
+      issues = issues.filter(i => db.isAlertMonitored(i));
+      skippedUnmonitored = before - issues.length;
+      purged = atomApi.isLive() ? db.purgeUnmonitoredAlerts() : 0;
+    }
 
     const plSynced = new Set();
     const seen = new Set();
@@ -97,15 +113,20 @@ async function sync() {
 
     // Alerts skipped as unmonitored still exist in ATOM — don't resolution-check them
     for (const id of fetchedIds) seen.add(id);
-    const resolved = await detectResolved(seen, truncated);
+    // Resolution checks are skipped while any view failed (can't tell "left the view" from "not fetched")
+    const incomplete = truncated || failedViewIds.length > 0;
+    const resolved = await detectResolved(seen, incomplete);
 
     lastCounts = {
       issues: upserted, occurrences: occs, playlist_versions: plVers, resolved,
       skipped_unmonitored: skippedUnmonitored, purged_unmonitored: purged,
-      catalog_feeds: db.countAtomFeeds(), catalog_errors: catalog.errors.length, truncated,
+      mode: mode || 'types', views: viewsMode ? atomApi.getViewList().filter(v => v.selected).length : 0,
+      view_errors: viewErrors ? viewErrors.length : 0,
+      catalog_feeds: db.countAtomFeeds(), catalog_errors: catalog.errors.length, truncated: incomplete,
     };
     lastSyncTime = new Date().toISOString(); lastSyncStatus = 'success';
-    console.log(`[sync] Done — issues:${upserted} skippedUnmonitored:${skippedUnmonitored} purged:${purged} occs:${occs} plVers:${plVers} resolved:${resolved} catalogFeeds:${lastCounts.catalog_feeds}${truncated ? ' (TRUNCATED)' : ''}`);
+    try { db.setMeta('last_atom_sync', lastSyncTime); } catch {}
+    console.log(`[sync] Done (${viewsMode ? `views:${lastCounts.views}` : 'types'}) — issues:${upserted} skippedUnmonitored:${skippedUnmonitored} purged:${purged} occs:${occs} plVers:${plVers} resolved:${resolved} catalogFeeds:${lastCounts.catalog_feeds}${truncated ? ' (TRUNCATED)' : failedViewIds.length ? ` (${failedViewIds.length} view(s) failed)` : ''}`);
   } catch (err) {
     lastSyncStatus='error'; lastSyncError=err.message;
     console.error('[sync] Failed:', err.message);
@@ -145,9 +166,14 @@ async function detectResolved(seen, truncated) {
 }
 
 function startSyncScheduler() {
-  sync();
-  cron.schedule('*/5 * * * *', () => sync());
-  console.log('[sync] Scheduler started (every 5 min)');
+  // Don't sync on every restart (dev servers restart a lot): only if the last success is old enough
+  let last = null;
+  try { last = Date.parse(db.getMeta('last_atom_sync')); } catch {}
+  const due = !Number.isFinite(last) || Date.now() - last >= SYNC_INTERVAL_MIN * 60e3;
+  if (due) sync();
+  else console.log(`[sync] last sync ${Math.round((Date.now() - last) / 60e3)} min ago — next on schedule`);
+  cron.schedule(`*/${SYNC_INTERVAL_MIN} * * * *`, () => sync());
+  console.log(`[sync] Scheduler started (every ${SYNC_INTERVAL_MIN} min, ATOM cap ${atomApi.rateInfo().limit_per_min} req/min)`);
 }
 
 module.exports = {
@@ -158,6 +184,8 @@ module.exports = {
     atom_live: atomApi.isLive(),
     atom_writeback: atomApi.isWritebackEnabled(),
     atom_auth: atomApi.authInfo(),
+    atom_rate: atomApi.rateInfo(),
+    interval_min: SYNC_INTERVAL_MIN,
   }),
   triggerSync: () => sync(),
 };

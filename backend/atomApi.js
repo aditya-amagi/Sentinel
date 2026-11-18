@@ -25,6 +25,8 @@
 const axios = require('axios');
 const AT    = require('./alertTypes');
 const TZ    = require('./atomTime');
+const { createGuard } = require('./atomGuard');
+const MOCK = require('./atomMock');
 
 const fs     = require('fs');
 const path   = require('path');
@@ -58,6 +60,14 @@ const DEFAULT_ALERT_TYPES = [
 ];
 const RAW_TYPES   = (process.env.ATOM_ALERT_TYPES || '').trim();
 const ALERT_TYPES = RAW_TYPES === '*' || RAW_TYPES.toLowerCase() === 'all' ? [] : (RAW_TYPES ? csv(RAW_TYPES) : DEFAULT_ALERT_TYPES);
+// Ingest mode. ATOM saved views (/me/views) carry each team's scope AND ignore rules, so by default
+// Sentinel pulls the alerts present in the region/customer views:
+//   ATOM_VIEWS=auto (default) → views named "<Group> Schedule|Asset|Live [Alerts]" (not "All …") + "Playout Rescue"
+//   ATOM_VIEWS=16,19,31        → exactly these view ids
+//   ATOM_VIEWS=off             → legacy: query by alert type (DEFAULT_ALERT_TYPES) across all of CP
+const VIEWS_SETTING = (process.env.ATOM_VIEWS || 'auto').trim();
+const VIEW_TIMEOUT_MS = Number(process.env.ATOM_VIEW_TIMEOUT_MS) || 120000; // some views take ATOM > 60 s
+const VIEW_CONCURRENCY = Math.max(1, Number(process.env.ATOM_MAX_CONCURRENCY) || 1);
 // Only alerts whose issue starts within the last N hours (or later — upcoming) are pulled. 0 = no window.
 const LOOKBACK_HOURS = Number(process.env.ATOM_LOOKBACK_HOURS ?? 72);
 const ALERT_STATES = csv(process.env.ATOM_ALERT_STATES || 'active,snoozed');
@@ -72,6 +82,14 @@ const client = BASE_URL ? axios.create({
 }) : null;
 
 const IS_LIVE = Boolean(client) && !DEMO_MODE;
+const IS_MOCK = !client && !DEMO_MODE;   // offline: realistic generated ATOM data (atomMock.js)
+
+// Every ATOM call (including login / token refresh) passes this guard: ≤ N requests per rolling
+// minute, ≤ M in flight, and a circuit breaker that pauses all calls when ATOM is struggling.
+const guard = createGuard({
+  perMin:      Math.max(1, Number(process.env.ATOM_MAX_REQUESTS_PER_MIN) || 20),
+  concurrency: Math.max(1, Number(process.env.ATOM_MAX_CONCURRENCY) || 1),
+});
 const WRITEBACK_ENABLED = IS_LIVE && process.env.ATOM_WRITEBACK === 'true';
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
@@ -96,7 +114,7 @@ function jwtExpiry(token) {
 }
 
 async function login() {
-  const res = await client.post('/auth/user/login', { email: EMAIL, password: PASSWORD });
+  const res = await guard.run(() => client.post('/auth/user/login', { email: EMAIL, password: PASSWORD }));
   const { token, expires_at } = res.data || {};
   if (!token) throw new Error('ATOM login succeeded but returned no token');
   const exp = Date.parse(expires_at);
@@ -139,7 +157,7 @@ async function refreshSso() {
   refreshing = (async () => {
     const cur = loadSso();
     try {
-      const res = await client.post('/auth/sso/refresh', { refresh_token: cur.refresh_token });
+      const res = await guard.run(() => client.post('/auth/sso/refresh', { refresh_token: cur.refresh_token }));
       const { token, refresh_token, expires_at } = res.data || {};
       if (!token) throw new Error('refresh succeeded but returned no token');
       const exp = Date.parse(expires_at);
@@ -196,11 +214,16 @@ function authInfo() {
 }
 
 /** Authenticated request. With login/refresh auth, a 401 forces one renewal and retry. */
-async function atomRequest(method, path, { params, data } = {}) {
-  const send = async () => client.request({ method, url: path, params, data, headers: await authHeaders() });
+async function atomRequest(method, path, { params, data, timeout } = {}) {
+  // Headers first (may refresh a token — itself a guarded call), then take a rate-limited slot
+  const send = async () => {
+    const headers = await authHeaders();
+    return guard.run(() => client.request({ method, url: path, params, data, headers, ...(timeout ? { timeout } : {}) }));
+  };
   try {
     return await send();
   } catch (err) {
+    if (err.paused) throw err;
     const mode = authMode();
     if (err.response?.status === 401 && (mode === 'login' || mode === 'refresh')) {
       try {
@@ -213,6 +236,7 @@ async function atomRequest(method, path, { params, data } = {}) {
   }
 }
 const atomGet = (path, params) => atomRequest('get', path, { params });
+const atomRequestWith = (method, path, opts) => atomRequest(method, path, opts);
 
 function describeError(err, method, path) {
   const status = err.response?.status;
@@ -237,7 +261,11 @@ const alertCache = new Map();
  */
 async function fetchAlerts({ feedLookup } = {}) {
   if (DEMO_MODE) return { issues: [], truncated: false };
-  if (!client)   return { issues: mockIssues(ri(26, 38)), truncated: false };
+  if (!client)   return fetchMock(feedLookup);
+
+  const views = await resolveViews();
+  if (views && views.length) return fetchAlertsByViews(views, feedLookup);
+  viewMembership = null;
 
   // Production ATOM only supports the singular `state` / `type` filters (staging also has the
   // plural `states` / `types`). Query one state (× one type, when types are configured) at a
@@ -297,8 +325,148 @@ function queryPlan(now = Date.now()) {
 function applyFeedInfo(issues, feedLookup) {
   return issues.map(iss => {
     const raw = alertCache.get(iss.id);
-    return raw ? normalizeAlert(raw, feedLookup) : iss;
+    return raw ? decorateWithViews(normalizeAlert(raw, feedLookup)) : iss;
   });
+}
+
+// ── Saved views ───────────────────────────────────────────────────────────────
+
+/** "EMEA Schedule Alerts" → {group:'EMEA', family:'Schedule'}; "Playout Rescue" → {group:'Playout Rescue'} */
+function parseViewName(name) {
+  const m = String(name || '').trim().match(/^(.*?)\s+(Schedule|Asset|Live)(?:\s+Alerts)?$/i);
+  if (m && m[1]) return { group: m[1].trim(), family: m[2].charAt(0).toUpperCase() + m[2].slice(1).toLowerCase() };
+  return { group: String(name || '').trim(), family: null };
+}
+
+/** Default selection: region/customer views (not the catch-all "All …" ones) + Playout Rescue. */
+function isDefaultView(v) {
+  const { group, family } = parseViewName(v.name);
+  if (/^playout rescue$/i.test(String(v.name).trim())) return true;
+  return Boolean(family) && !/^all\b/i.test(group);
+}
+
+let lastViews = [];          // [{id, name, group, family, selected}]
+let viewMembership = null;   // alert_id → [view ids] (views mode only)
+
+/** GET /me/views → the views to ingest, or null for legacy type mode. Never throws. */
+async function resolveViews() {
+  if (/^off$/i.test(VIEWS_SETTING)) return null;
+  let all;
+  try {
+    const res = await atomGet('/me/views', { limit: 200 });
+    const body = res.data || {};
+    all = (Array.isArray(body) ? body : body.views || body.items || []).filter(v => v && v.id != null);
+  } catch (err) {
+    console.warn(`[atom] /me/views unavailable (${err.message}) — falling back to type-based ingestion`);
+    return null;
+  }
+  const ids = /^auto$/i.test(VIEWS_SETTING) ? null : new Set(csv(VIEWS_SETTING).map(String));
+  lastViews = all.map(v => ({ id: Number(v.id), name: v.name, ...parseViewName(v.name),
+    selected: ids ? ids.has(String(v.id)) : isDefaultView(v) }));
+  const chosen = lastViews.filter(v => v.selected);
+  if (!chosen.length) console.warn('[atom] no ATOM views matched ATOM_VIEWS — falling back to type-based ingestion');
+  return chosen.length ? chosen : null;
+}
+
+/**
+ * Pull every selected view (state by state, newest first), stopping at the lookback cutoff.
+ * ATOM rejects other filters with view_id and ignores issue_start_time, so the window is applied here.
+ */
+async function fetchAlertsByViews(views, feedLookup) {
+  const cutoff = LOOKBACK_HOURS > 0 ? Date.now() - LOOKBACK_HOURS * 3600e3 : null;
+  const byId = new Map();
+  const membership = new Map();
+  const viewErrors = [];
+  const failedViewIds = [];
+  let truncated = false;
+
+  const one = async view => {
+    for (const state of ALERT_STATES) {
+      for (let page = 0, offset = 0; ; page++) {
+        let res;
+        try {
+          res = await atomRequestWith('get', '/alerts', { timeout: VIEW_TIMEOUT_MS,
+            params: { view_id: view.id, state, sort_by: 'issue_start_time', sort_order: 'desc', limit: PAGE_SIZE, offset } });
+        } catch (err) {
+          viewErrors.push(`${view.name}: ${err.message}`);
+          failedViewIds.push(view.id);
+          return;
+        }
+        const body = res.data || {};
+        const items = Array.isArray(body) ? body : (body.items || []);
+        let reachedCutoff = false;
+        for (const a of items) {
+          const t = Date.parse(a.issue_start_time || a.created_at);
+          if (cutoff && Number.isFinite(t) && t < cutoff) { reachedCutoff = true; continue; }
+          const id = a.alert_id != null ? String(a.alert_id) : null;
+          if (!id) continue;
+          byId.set(id, a);
+          if (!membership.has(id)) membership.set(id, []);
+          if (!membership.get(id).includes(view.id)) membership.get(id).push(view.id);
+        }
+        if (reachedCutoff || Array.isArray(body) || !body.has_next || items.length === 0) break;
+        if (page + 1 >= MAX_PAGES) { truncated = true; console.warn(`[atom] view "${view.name}" (${state}) stopped after ${MAX_PAGES} pages`); break; }
+        offset += items.length;
+      }
+    }
+  };
+  const queue = [...views];
+  await Promise.all(Array.from({ length: Math.min(VIEW_CONCURRENCY, queue.length) }, async () => {
+    for (let v = queue.shift(); v; v = queue.shift()) await one(v);
+  }));
+  if (viewErrors.length) console.warn(`[atom] ${viewErrors.length} view(s) failed: ${viewErrors.join(' · ')}`);
+
+  viewMembership = membership;
+  alertCache.clear();
+  const issues = [];
+  for (const [id, a] of byId) {
+    alertCache.set(id, a);
+    issues.push(decorateWithViews(normalizeAlert(a, feedLookup)));
+  }
+  // `truncated` = a view hit ATOM_MAX_PAGES. Failed views are reported separately: only alerts known
+  // to belong to them are protected from purging (sync.js), everything else is still reconciled.
+  return { issues, truncated, mode: 'views', views: views.length, viewErrors, failedViewIds };
+}
+
+/** Attach view membership; the first selected view's group becomes the region. */
+function decorateWithViews(iss) {
+  if (!viewMembership || !iss) return iss;
+  const ids = viewMembership.get(iss.id) || [];
+  const vs = ids.map(id => lastViews.find(v => v.id === id)).filter(Boolean);
+  if (!vs.length) return iss;
+  return {
+    ...iss,
+    atom_view_ids:   `,${vs.map(v => v.id).join(',')},`,
+    atom_view_names: JSON.stringify(vs.map(v => v.name)),
+    view_group:      vs[0].group,
+    view_family:     vs[0].family,
+    region:          vs[0].group,
+  };
+}
+
+const getViewList = () => lastViews.slice();
+
+/** Mock mode: same view selection, lookback, normalisation and view tagging as live — offline data. */
+function fetchMock(feedLookup) {
+  const ids = /^(auto|off)$/i.test(VIEWS_SETTING) ? null : new Set(csv(VIEWS_SETTING).map(String));
+  lastViews = MOCK.VIEWS.map(v => ({ id: v.id, name: v.name, ...parseViewName(v.name),
+    selected: ids ? ids.has(String(v.id)) : isDefaultView(v) }));
+  const selected = new Set(lastViews.filter(v => v.selected).map(v => v.id));
+  const cutoff = LOOKBACK_HOURS > 0 ? Date.now() - LOOKBACK_HOURS * 3600e3 : null;
+  const { alerts, membership } = MOCK.generate();
+  viewMembership = new Map();
+  alertCache.clear();
+  const issues = [];
+  for (const a of alerts) {
+    const inViews = (membership.get(a.alert_id) || []).filter(id => selected.has(id));
+    if (!inViews.length) continue;
+    const t = Date.parse(a.issue_start_time);
+    if (cutoff && Number.isFinite(t) && t < cutoff) continue;
+    viewMembership.set(a.alert_id, inViews);
+    alertCache.set(a.alert_id, a);
+    issues.push(decorateWithViews(normalizeAlert(a, feedLookup)));
+  }
+  return { issues, truncated: false, mode: 'views', views: selected.size, viewErrors: [], failedViewIds: [] };
 }
 
 /** Backward-compatible: issues only. */
@@ -319,7 +487,11 @@ async function getAlert(alertId, { history = false } = {}) {
 /** Occurrences for an issue. In ATOM each alert is one occurrence (start time + duration). */
 async function getIssueDetails(issue) {
   if (DEMO_MODE) return [];
-  if (!client)   return mockOccs(typeof issue === 'object' ? issue : { id: issue }, ri(1, 6));
+  if (!client) {
+    const iss = typeof issue === 'object' ? issue : { id: issue };
+    const a = alertCache.get(iss.id);
+    return a ? [alertToOccurrence(iss, a)] : [];
+  }
 
   const iss = typeof issue === 'object' ? issue : { id: issue };
   const alert = alertCache.get(iss.id) || await getAlert(iss.id);
@@ -347,7 +519,7 @@ function markForbidden(key, err) {
  */
 async function getPlaylistTimeline(feed_code, playlist_date, region, automation_url) {
   if (DEMO_MODE) return [];
-  if (!client)   return mockTimeline(feed_code, playlist_date, region);
+  if (!client)   return mockTimeline(feed_code, playlist_date, region);   // deterministic per feed/date
 
   automation_url = automation_url || automationUrlByFeed.get(feed_code);
   if (!feed_code || !playlist_date || !automation_url || isForbidden('published_playlist')) return [];
@@ -406,6 +578,7 @@ async function getPlaylist(automation_url, feed_code, playlist_date) {
 
 /** GET /customers/{automation_url}?detailed=true (raw), or null. */
 async function getCustomer(automation_url) {
+  if (IS_MOCK) return MOCK.customer(automation_url);
   if (!IS_LIVE || !automation_url) return null;
   try {
     const res = await atomGet(`/customers/${encodeURIComponent(automation_url)}`, { detailed: true });
@@ -544,66 +717,20 @@ function regionFromCloud(r) {
   return null;
 }
 
-// ── Random mock data (dev fallback when neither DEMO nor real API) ────────────
+// ── Offline helpers (mock mode; realistic alerts come from atomMock.js) ──────────
 
-const REGIONS = ['APAC','US','EMEA'];
-const REGION_FEEDS = {
-  APAC: ['AMG01579C1','AMG02341B2','STAR_SPORTS_HD'],
-  US:   ['ESPN4K001','FOX_NEWS_HD','NBC_EAST'],
-  EMEA: ['BRD00123X4','NATGEO_UHD','SKY_UK_HD'],
-};
-const HOSTS      = ['encoder-01.prod','encoder-02.prod','encoder-03.prod'];
-const ACCOUNTS   = ['account_alpha','account_beta'];
-const SEVERITIES = ['minor','major','major','critical','blocker'];
-const OTHER_TYPES = ['tarang_media_seq_stall_alert','ingest_audio_channel_misconfiguration_alert','medialive_degraded_status_alert'];
-
-function rand(a)  { return a[Math.floor(Math.random()*a.length)]; }
-function ri(a,b)  { return Math.floor(Math.random()*(b-a+1))+a; }
-
-function mockIssues(n=28) {
-  const now=new Date(), issues=[];
-  for (let i=1;i<=n;i++) {
-    const region=rand(REGIONS), feed_code=rand(REGION_FEEDS[region]);
-    const offset=Math.random()<0.6?ri(0,5):ri(-10,-1);
-    const start=new Date(now); start.setDate(start.getDate()+offset); start.setHours(ri(6,22),ri(0,59),0,0);
-    const type = Math.random() < 0.8 ? rand(AT.ALERT_KEYS) : rand(OTHER_TYPES);
-    issues.push({
-      id:`ATOM-ISSUE-${String(i).padStart(5,'0')}`, feed_code, region,
-      host:rand(HOSTS), account:rand(ACCOUNTS), issue_type:type, raw_type:type,
-      consolidated_status:rand(['active','active','snoozed']),
-      severity:rand(SEVERITIES), alert_name:AT.label(type), description:`Mock ${AT.label(type)} on ${feed_code}`,
-      playlist_id:String(200000+ri(1000,99999)),
-      playlist_date:start.toISOString().split('T')[0],
-      playlist_start_time:start.toISOString(),
-      earliest_scheduled:start.toISOString(),
-      duration_ms: ri(0, 3) ? ri(10, 600) * 1000 : -1,
-      asset_id:Math.random()>0.45?`ASSET-${ri(10000,99999)}`:null,
-      penalty:Math.random()>0.3,
-    });
-  }
-  return issues;
-}
-
-function mockOccs(issue, n) {
-  return Array.from({length:n}, () => {
-    const t=new Date(issue.playlist_start_time||new Date()); t.setMinutes(t.getMinutes()+ri(5,200));
-    return {
-      atom_issue_id:issue.id, feed_code:issue.feed_code, region:issue.region,
-      playout_start_time:t.toISOString(), duration:`${ri(1,600)}s`,
-      asset_id:issue.asset_id||(Math.random()>0.5?`ASSET-${ri(10000,99999)}`:null),
-      playlist_id:issue.playlist_id, playlist_date:issue.playlist_date,
-      issue_type:issue.issue_type, raw_payload:JSON.stringify({mock:true}),
-    };
-  });
-}
 
 function mockTimeline(feed_code, playlist_date, region) {
-  const base=230000+Math.floor(Math.random()*9999), n=ri(1,3);
-  const date=new Date(playlist_date+'T06:00:00Z');
-  return Array.from({length:n},(_,i)=>{
-    const p=new Date(date); p.setHours(6+i*ri(2,4),ri(0,59),ri(0,59));
-    return {feed_code,playlist_date,playlist_id:String(base+i*ri(20,80)),published_at:p.toISOString(),region};
-  });
+  if (!feed_code || !playlist_date) return [];
+  let h = [...`${feed_code}|${playlist_date}`].reduce((x, c) => (x * 31 + c.charCodeAt(0)) >>> 0, 17);
+  const base = 230000 + (h % 9999), n = 1 + (h % 3);
+  const day = Date.parse(`${playlist_date}T06:00:00Z`);
+  if (!Number.isFinite(day)) return [];
+  return Array.from({ length: n }, (_, i) => ({
+    feed_code, playlist_date, region,
+    playlist_id: String(base + i * 37),
+    published_at: new Date(day - (n - i) * 5 * 3600e3).toISOString(),
+  }));
 }
 
 /** Deterministic synthetic playlist: 30-minute items across the day (demo/mock only). */
@@ -643,7 +770,13 @@ module.exports = {
   getPlaylistTimeline, getPlaylist, getCustomer,
   patchAlerts, snoozeAlert, desnoozeAlert, commentAlert,
   isLive: () => IS_LIVE,
+  isMock: () => IS_MOCK,
   authInfo,
+  rateInfo: () => guard.info(),
+  isPaused: () => guard.isPaused(),
+  getViewList,
+  parseViewName,
+  viewsMode: () => !/^off$/i.test(VIEWS_SETTING),
   queryPlan,
   DEFAULT_ALERT_TYPES,
   isWritebackEnabled: () => WRITEBACK_ENABLED,

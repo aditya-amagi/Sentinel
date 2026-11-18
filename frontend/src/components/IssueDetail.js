@@ -14,7 +14,7 @@ export default function IssueDetail({ atomIssueId, playlistId, onClose, onUpdate
   const [tab, setTab]         = useState('overview');
   const [feed, setFeed]       = useState(null);
   const [fdTickets, setFd]    = useState([]);
-  const [showModal, setModal] = useState(false);
+  const [showModal, setModal] = useState(false);   // false | 'create' | 'followup'
   const [notice, setNotice]   = useState(null);
 
   const load = useCallback(async () => {
@@ -55,6 +55,7 @@ export default function IssueDetail({ atomIssueId, playlistId, onClose, onUpdate
 
   const { issue, occurrences = [], playlistTimeline = [], previousTicketDetail } = data;
   const state = triageOf(issue);
+  const parentTicket = fdTickets.find(t => t.ticket_type !== 'followup' && t.freshdesk_id) || null;
 
   return (
     <div className="dp">
@@ -99,26 +100,36 @@ export default function IssueDetail({ atomIssueId, playlistId, onClose, onUpdate
         {tab === 'overview' && <Overview issue={issue} feed={feed} occurrences={occurrences} />}
         {tab === 'playlist' && <PlaylistTab issue={issue} timeline={playlistTimeline} occurrences={occurrences} feed={feed} />}
         {tab === 'activity' && <ActivityTab issue={issue} occurrences={occurrences} />}
-        {tab === 'tickets'  && <TicketsTab tickets={fdTickets} onCreate={() => setModal(true)} />}
+        {tab === 'tickets'  && <TicketsTab tickets={fdTickets} onCreate={() => setModal('create')} onFollowup={() => setModal('followup')} />}
       </div>
 
       <div className="dp-actions">
         <AckButton issue={issue} onChange={onTriage} size="md" />
         {state === 'ticketed' && <span className="dp-locked">Ticketed — triage locked</span>}
-        <button className="btn primary dp-create" onClick={() => setModal(true)}>
-          {fdTickets.length ? 'Create another ticket' : 'Create Freshdesk ticket'}
-        </button>
+        {parentTicket ? (
+          <span className="dp-ticket-actions">
+            <button className="btn" onClick={() => setModal('create')}>New ticket</button>
+            <button className="btn primary" onClick={() => setModal('followup')}>
+              Follow up on {parentTicket.ticket_number || `#${parentTicket.freshdesk_id}`}
+            </button>
+          </span>
+        ) : (
+          <button className="btn primary dp-create" onClick={() => setModal('create')}>Create Freshdesk ticket</button>
+        )}
       </div>
 
       {showModal && (
-        <TicketModal issue={issue} feed={feed} onClose={() => setModal(false)}
+        <TicketModal issue={issue} feed={feed} parentTicket={parentTicket} initialMode={showModal} onClose={() => setModal(false)}
           onCreated={result => {
             const atomNote = result.atom && !result.atom.skipped
-              ? (result.atom.ok ? ' · comment added in ATOM' : ` · ATOM comment failed: ${result.atom.error}`) : '';
-            setNotice({ tone: result.atom?.ok === false ? 'err' : 'ok', text: `Ticket ${result.ticket_number} created${atomNote}` });
+              ? (result.atom.ok ? ' · noted in ATOM' : ` · ATOM note failed: ${result.atom.error}`) : '';
+            const what = result.followup
+              ? `Follow-up ${result.number} sent on ${result.parent}`
+              : `Ticket ${result.ticket_number} created${result.covers > 1 ? ` for ${result.covers} alerts` : ''}`;
+            setNotice({ tone: result.atom?.ok === false ? 'err' : 'ok', text: `${what}${result.mock ? ' (mock)' : ''}${atomNote}` });
             setTab('tickets');
             load();
-            onUpdate && onUpdate({ ...issue, ticket_id: result.ticket_number, ticket_link: result.ticket_url });
+            if (!result.followup) onUpdate && onUpdate({ ...issue, state: 'ticketed', ticket_id: result.ticket_number, ticket_link: result.ticket_url });
           }} />
       )}
     </div>
@@ -163,6 +174,7 @@ function Overview({ issue, feed, occurrences }) {
         <dl className="kv">
           <KV k="Feed" v={<>{issue.feed_code}{(feed?.feed_name || issue.feed_name) && <span className="kv-sub"> {feed?.feed_name || issue.feed_name}</span>}</>} mono />
           <KV k="Customer" v={feed?.customer_name} />
+          <KV k="ATOM views" v={(() => { try { return JSON.parse(issue.atom_view_names || '[]').join(', '); } catch { return null; } })()} />
           <KV k="AMG ID" v={issue.amg_id || feed?.amg_id} mono />
           <KV k="Headend" v={issue.headend_code || issue.host} mono />
           <KV k="Automation" v={issue.automation_url || feed?.automation_url} mono />
@@ -338,7 +350,7 @@ function ActivityTab({ issue, occurrences }) {
 
 // ── Tickets ─────────────────────────────────────────────────────────────────
 
-function TicketsTab({ tickets, onCreate }) {
+function TicketsTab({ tickets, onCreate, onFollowup }) {
   if (!tickets.length) return (
     <div className="empty-state">
       <span className="empty-title">No tickets yet</span>
@@ -346,20 +358,37 @@ function TicketsTab({ tickets, onCreate }) {
       <button className="btn primary" onClick={onCreate} style={{ marginTop: 8 }}>Create Freshdesk ticket</button>
     </div>
   );
+  const ts = t => fmtShort(t.created_at && `${String(t.created_at).replace(' ', 'T')}Z`);
+  const originals = tickets.filter(t => t.ticket_type !== 'followup');
+  const followupsOf = t => tickets.filter(f => f.ticket_type === 'followup' && f.freshdesk_id === t.freshdesk_id)
+    .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
   return (
     <section className="dp-section">
       <ul className="tickets">
-        {tickets.map(t => (
-          <li key={t.id}>
-            <span className={`t-type ${t.ticket_type}`}>{t.ticket_type === 'internal' ? 'Internal' : 'Customer'}</span>
-            <div className="t-main">
-              <span className="mono">{t.ticket_number || `FD-${t.freshdesk_id}`}</span>
-              <span className="kv-sub">{t.requester_email || 'no requester'} · {fmtShort(t.created_at && `${t.created_at.replace(' ', 'T')}Z`)}</span>
-            </div>
-            {t.ticket_url && <a className="btn sm" href={t.ticket_url} target="_blank" rel="noopener noreferrer">Open ↗</a>}
-          </li>
-        ))}
+        {originals.map(t => {
+          const fus = followupsOf(t);
+          return (
+            <li key={t.id} className="ticket-block">
+              <div className="ticket-head">
+                <span className={`t-type ${t.ticket_type}`}>{t.ticket_type === 'internal' ? 'Internal' : 'Customer'}</span>
+                <div className="t-main">
+                  <span className="mono">{t.ticket_number || `FD-${t.freshdesk_id}`}</span>
+                  <span className="kv-sub">{t.requester_email || 'no requester'} · {ts(t)}</span>
+                </div>
+                {t.ticket_url && <a className="btn sm" href={t.ticket_url} target="_blank" rel="noopener noreferrer">Open ↗</a>}
+              </div>
+              {fus.length > 0 && (
+                <ol className="followups">
+                  {fus.map((f, n) => (
+                    <li key={f.id}><span className="fu-dot" />Follow-up {n + 1} · {String(f.subject || '').replace(/^Follow-up \d+ /, '').replace(/[()]/g, '') || 'sent'} · <span className="kv-sub">{ts(f)}</span></li>
+                  ))}
+                </ol>
+              )}
+            </li>
+          );
+        })}
       </ul>
+      <button className="btn" onClick={onFollowup} style={{ marginTop: 10 }}>Send a follow-up</button>
     </section>
   );
 }

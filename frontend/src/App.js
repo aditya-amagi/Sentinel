@@ -12,7 +12,7 @@ import SRETerminal, { setSREContext } from './components/SRETerminal';
 import './App.css';
 
 export default function App() {
-  const { page, region, navigate }              = useRegionRoute();
+  const { page, region, family, navigate }      = useRegionRoute();
   const { user, loading: authLoading, authenticated, auth_configured, logout } = useAuth();
 
   const [appLoading, setAppLoading] = useState(true);
@@ -23,7 +23,7 @@ export default function App() {
 
   const fetchStats = useCallback(async () => {
     try {
-      const p = region ? `?region=${region}` : '';
+      const p = region ? `?region=${encodeURIComponent(region)}` : '';
       setStats(await (await fetch(`/api/stats${p}`, { credentials: 'include' })).json());
     } catch {}
   }, [region]);
@@ -77,6 +77,7 @@ export default function App() {
         onSync={handleSync}
         syncing={syncing}
         region={region}
+        family={family}
         page={page}
         user={user}
         onLogout={logout}
@@ -85,14 +86,15 @@ export default function App() {
         <RegionNav
           regions={regions}
           active={region}
+          activeFamily={family}
           page={page}
           stats={stats}
-          onSelect={(r)  => navigate(page, r)}
+          onSelect={(r, f) => navigate(page, r, f)}
           onPageChange={(p) => navigate(p, region)}
         />
         <div className="app-right">
           {page === 'settings'  && <ContactsPage />}
-          {page === 'dashboard' && <DashboardPage region={region} onStatsChange={fetchStats} stats={stats} />}
+          {page === 'dashboard' && <DashboardPage region={region} family={family} onStatsChange={fetchStats} stats={stats} />}
           {page === 'history'   && <HistoryPage   region={region} />}
         </div>
       </div>

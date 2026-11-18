@@ -1,5 +1,9 @@
 'use strict';
 
+// Tests talk to a local fake ATOM: lift the production rate cap so they run instantly
+process.env.ATOM_MAX_REQUESTS_PER_MIN = '100000';
+process.env.ATOM_MAX_CONCURRENCY = '8';
+
 // Full sync against a fake ATOM: catalog → atom_feeds, contact prefill, full-field storage,
 // resolution detection, the truncation guard, filters, playlist context and the ticket body.
 
@@ -69,7 +73,7 @@ describe('ATOM sync → Sentinel', () => {
   it('purges untouched alerts when a feed is switched off, but keeps triaged ones', async () => {
     db.updateIssue(db.getIssueByCompositeKey('1007', '230001').issue.id, { state: 'ack', acknowledged: 1 });
     fake.customers['customer-abc.amagi.tv'].accounts[0].feeds[2].headends.forEach(h => { h.health.monitoring = false; });
-    db.getDb().prepare(`UPDATE atom_feeds SET synced_at = datetime('now','-1 day')`).run(); // force catalog refresh
+    db.getDb().prepare(`UPDATE atom_feeds SET synced_at = datetime('now','-2 days')`).run(); // force catalog refresh (default refresh: 24h)
     await sync.triggerSync();
     const has = id => !!db.getDb().prepare('SELECT 1 FROM issues WHERE atom_issue_id=?').get(id);
     assert.equal(has('1008'), false, 'untriaged alert on now-unmonitored feed removed');
@@ -154,8 +158,19 @@ describe('ATOM sync → Sentinel', () => {
     const issue = db.getIssueByCompositeKey('1004', '230001').issue;
     const p = db.buildFreshdeskPayload(issue, 'internal');
     assert.equal(p.priority, 4);
-    assert.match(p.subject, /Tarang Media Seq Stall - AMG01579C1/);
-    for (const s of ['ABC Movies HD', 'Critical', 'Media seq stall', '5m', 'fa_001', 'customer-abc.amagi.tv', '1004', 'Asia/Kolkata'])
+    assert.match(p.subject, /Tarang Media Seq Stall - ABC Movies HD \(AMG01579C1\)/);
+    for (const s of ['ABC Movies HD', 'Critical', 'Media seq stall', '00:05:00', 'fa_001', 'customer-abc.amagi.tv', '1004', 'Asia/Kolkata', 'Technical details'])
       assert.ok(p.description.includes(s), `description should include ${s}`);
+  });
+
+  it('one ticket covers every open alert of the same type on the feed and broadcast day', () => {
+    // 1001 and 1003 are both hole_in_playlist on AMG01579C1 / 2026-11-18
+    const issue = db.getIssueByCompositeKey('1003', '230001').issue;
+    const p = db.buildFreshdeskPayload(issue, 'customer');
+    const ids = p._meta.covers.map(c => c.atom_issue_id).sort();
+    assert.ok(ids.includes('1003') && ids.length >= 1);
+    assert.ok(p.description.includes('What we need from you'));
+    assert.ok(p.description.includes('Fill the gap'), 'hole-specific action');
+    assert.ok(!p.description.includes('Technical details'), 'customer tickets carry no internal section');
   });
 });

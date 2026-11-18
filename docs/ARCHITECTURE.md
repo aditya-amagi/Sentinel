@@ -2,7 +2,8 @@
 
 > **System Designation**: Sentinel (Amagi TOC Alert Monitoring & Ticket Automation)  
 > **Target Audience**: SREs, NOC Engineers, Backend/Frontend Developers, Platform Architects  
-> **Last Updated**: 2026-11-03  
+> **Last Updated**: 2026-11-18  
+> **ATOM details**: see [`ATOM_INTEGRATION.md`](ATOM_INTEGRATION.md)  
 
 ---
 
@@ -22,12 +23,13 @@
 ```mermaid
 flowchart TD
     subgraph Upstream["Upstream Broadcast Telemetry"]
-        ATOM["Amagi ATOM Telemetry API<br/>(Issues, Details, Feed Playlists)"]
+        ATOM["Amagi ATOM v1 API<br/>(/alerts, /customers, playlists)"]
         DEMO["Deterministic Demo Generator<br/>(seed: atom-demo)"]
     end
 
     subgraph BackendEngine["Sentinel Backend (Express 4.18 + better-sqlite3)"]
         SYNC["Sync Engine (node-cron)<br/>5-min interval"]
+        CAT["Feed Catalog + Monitoring Filter<br/>(atomCatalog.js → atom_feeds)"]
         NORM["Normalizer & Alert Enum Parser<br/>(alertTypes.js)"]
         PERSIST["Same-Day Persistence Engine<br/>(Cross-playlist ticket check)"]
         CONTACTS["Contact Resolution Engine<br/>(General & Per-Type Overrides)"]
@@ -52,7 +54,10 @@ flowchart TD
         SRECON["SRE Debug Terminal<br/>(Hidden 'letmein' / Ctrl+`)"]
     end
 
-    ATOM -.->|Poll Issues & Occurrences| SYNC
+    ATOM -.->|"Poll /alerts (state × type, 72h)"| SYNC
+    ATOM -.->|"/customers?detailed=true"| CAT
+    CAT --> SYNC
+    API -.->|"optional write-back:<br/>snooze / comment"| ATOM
     DEMO -.->|Seed Startup DB| DB
     SYNC --> NORM --> PERSIST --> DB
     AUTH <-->|OIDC Auth Code Grant| ONELOGIN
@@ -199,12 +204,15 @@ erDiagram
 4. **`feed_ticket_config`**: Feed-level customer ticket routing configuration. Primary key `feed_code`.
 5. **`issue_contact_override`**: Per-alert-type overrides when `use_general_for_all = 0`. Unique constraint on `(feed_code, issue_type)`.
 6. **`freshdesk_tickets`**: Full audit log of tickets created via Freshdesk integration.
+7. **`atom_feeds`** (migrations 004, 006): ATOM feed catalog — feed name, customer, AMG ID, timezone, broadcast-day start, headends (with `health.monitoring`), `data_only`, `monitored`. Primary key `feed_code`.
+
+Migrations 004–005 also add the full ATOM alert record to `issues` (`severity`, `alert_name`, `description`, `raw_type`, `consolidated_status` lifecycle, snooze/resolve fields, `duration_ms`, `headend_code`, `automation_url`, `amg_id`, `feed_name`, `source_url`, `dedup_key`, `correlation_id`, `labels`, `custom_details`, `atom_writeback_error`). Column-by-column mapping: [`ATOM_INTEGRATION.md` §4.4](ATOM_INTEGRATION.md#44-field-mapping-normalizealert).
 
 ---
 
-## 4. Alert Types: The Four Fixed Invariants
+## 4. Alert Types: The Four TOC Types + Other ATOM Alerts
 
-Alert types are strictly defined in `backend/alertTypes.js`. They are non-dynamic invariants throughout the entire system:
+The four **TOC types** are defined in `backend/alertTypes.js`. They drive per-type contact overrides and ticket subjects. Every other ATOM type Sentinel ingests, such as rescue played, ingest configuration or asset failed, is kept under its **raw ATOM type**. It appears in the dashboard's **Other ATOM alerts** section, can be acked and ticketed, routes to the feed's general contact, and gets a humanised label (`player_rescue_detected_alert` → "Player Rescue Detected"):
 
 | Canonical Enum Key | UI Display Label | Freshdesk Ticket Subject Template | Description |
 | :--- | :--- | :--- | :--- |
@@ -214,7 +222,7 @@ Alert types are strictly defined in `backend/alertTypes.js`. They are non-dynami
 | `MISSING_IN_CLOUD` | Missing in Cloud (Production) | `TOC Alert [AM3] : Asset Missing in Cloud - {FEED} - {DATE}` | Asset scheduled for linear playout has not been ingested or transcoded to cloud storage. |
 
 ### Fuzzy Normalization
-ATOM telemetry occasionally produces slight string variations (e.g. `HOLE_IN_PLAYLIST`, `MISSING_PLAYLIST`, `ASSET_MISSING_IN_CLOUD`). The function `toEnumKey(raw)` normalizes any variant into one of the four canonical enum keys before persistence.
+`toEnumKey(raw)` maps ATOM's type strings onto the four keys: `hole_in_playlist` / `playlist_hole` → `HOLE`, `no_published_playlist` → `NO_PLAYLIST`, `asset_duration_mismatch` → `DURATION_MISMATCH`, `asset_missing_in_cloud` → `MISSING_IN_CLOUD`, plus legacy variants. Anything else returns `null`, and the raw type is kept. The full table is in [`ATOM_INTEGRATION.md` §4.3](ATOM_INTEGRATION.md#43-type-normalisation-alerttypestoenumkey).
 
 ---
 
@@ -238,6 +246,17 @@ stateDiagram-v2
 1. **`penalty` (Default)**: Alert carries operational/contractual SLA penalties. Displayed prominently with red indicators.
 2. **`ack`**: Operator has acknowledged the alert (e.g. deliberate maintenance, known issue). SLA penalty is mitigated. Can be reopened back to `penalty`.
 3. **`ticketed`**: Ticket has been created in Freshdesk (or mock). State is permanently locked. Any attempt to modify the state via `PATCH /api/issues/.../state` returns HTTP `409 Conflict`.
+
+### Two independent lifecycles
+- **Sentinel triage** (`issues.state`): `penalty` → `ack` → `ticketed`, owned by operators. A sync never overwrites it.
+- **ATOM lifecycle** (`issues.consolidated_status`): `active` / `snoozed` / `resolved`, owned by ATOM. Updated on every sync, and by resolution detection for alerts that drop out of ATOM's open list. The dashboard hides `resolved` by default (ATOM state filter "Open").
+
+With `ATOM_WRITEBACK=true`, the two are linked by operator actions only:
+- **Ack** with a chosen snooze → ATOM snooze.
+- **Reopen** → ATOM de-snooze.
+- **Ticket created** → ATOM comment with the ticket link.
+
+Sentinel never resolves an ATOM alert.
 
 ---
 
@@ -298,7 +317,12 @@ flowchart TD
 ```
 
 ### Ticket Formats:
-- **Customer Ticket**: Dispatched to the customer's technical contact. The HTML body includes a formal greeting (`Dear {Customer} Team,`), a structured monospace table with Feed, Alert Type, Asset ID, Playlist ID, and Start Time (UTC), and TOC sign-off.
+- **Customer Ticket**: Dispatched to the customer's technical contact. The HTML body has:
+    - a formal greeting (`Dear {Customer} Team,`). The customer name falls back to the ATOM catalog when none is configured.
+    - a monospace table of whichever fields exist: Feed (+ feed name), AMG ID, Issue Type, Alert name, Severity, Details (ATOM description), Asset ID, Playlist ID / Date, Start Time, Issue Start (UTC + feed local time), Duration, Headend, Automation, Customer, ATOM Alert ID, Link (CloudPort).
+    - a TOC sign-off. All values are HTML-escaped.
+- **Priority** follows ATOM severity: blocker/critical → 4 (Urgent), major → 3 (High), minor → 2 (Medium), dev → 1 (Low), unknown → 2. It is raised to Urgent when the alert is on-air now or airs within 2 hours.
+- **Current wording, coverage of related alerts and follow-ups**: see [`TICKETS_AND_FOLLOWUPS.md`](TICKETS_AND_FOLLOWUPS.md). It supersedes the field list above.
 - **Internal Ticket**: Always sent to `amagisupportcontact@amagi.com` (configurable via `INTERNAL_TICKET_EMAIL` env var), regardless of feed settings.
 
 ---

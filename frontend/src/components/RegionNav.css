@@ -63,3 +63,22 @@
   .sn-item { justify-content: center; padding: 0; }
   .sn-atom { justify-content: center; padding: 10px 0; }
 }
+
+/* ATOM view groups */
+.sn-group { display: flex; flex-direction: column; }
+.sn-group-row { padding: 0 4px 0 2px; gap: 2px; }
+.sn-group-btn {
+  flex: 1; display: flex; align-items: center; gap: 10px; height: 100%; min-width: 0;
+  border: 0; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; padding: 0 6px;
+}
+.sn-group-btn .sn-label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sn-caret {
+  width: 22px; height: 22px; border: 0; border-radius: 5px; background: transparent; color: var(--text-muted);
+  font-size: 16px; line-height: 1; cursor: pointer; transition: transform 0.15s; flex-shrink: 0;
+}
+.sn-caret:hover { background: var(--bg-active); color: var(--text-primary); }
+.sn-caret.open { transform: rotate(90deg); }
+.sn-caret-spacer { width: 22px; flex-shrink: 0; }
+.sn-sub { height: 30px; padding-left: 40px; font-size: 13px; }
+.sn-zero { font-size: 11.5px; color: var(--text-faint); min-width: 24px; text-align: right; }
+.tb-region { text-transform: uppercase; }

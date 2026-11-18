@@ -100,4 +100,21 @@ async function getTicket(freshdesk_id) {
   return res.data;
 }
 
-module.exports = { createTicket, getTicket, isMock: () => !DOMAIN || !API_KEY };
+/** Public reply on an existing ticket (emails the requester + CCs). Mock mode just logs. */
+async function replyToTicket(freshdesk_id, html) {
+  const client = getClient();
+  if (!client) {
+    console.log(`[freshdesk] MOCK — reply to ticket ${freshdesk_id} (${String(html).length} chars)`);
+    return { mock: true, freshdesk_id };
+  }
+  try {
+    const res = await client.post(`/tickets/${freshdesk_id}/reply`, { body: html });
+    return { mock: false, freshdesk_id, reply_id: res.data?.id };
+  } catch (err) {
+    const detail = err.response?.data || err.message;
+    console.error('[freshdesk] replyToTicket failed:', detail);
+    throw new Error(`Freshdesk API error: ${JSON.stringify(detail)}`);
+  }
+}
+
+module.exports = { createTicket, getTicket, replyToTicket, isMock: () => !DOMAIN || !API_KEY };

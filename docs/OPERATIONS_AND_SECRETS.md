@@ -7,7 +7,7 @@
 
 ## 1. Environment Configuration Reference
 
-Configuration is managed via environment variables in `backend/.env` (or Docker environment overrides).
+Configuration lives in `backend/.env`. The backend loads it at startup, and real environment variables win. Docker passes the same file via `env_file`. The file is git-ignored and never copied into images; keep it `chmod 600`. Start from `backend/.env.example`. ATOM settings are explained in depth in [`ATOM_INTEGRATION.md` §2](ATOM_INTEGRATION.md#2-configuration).
 
 | Variable | Description | Required | Default / Example |
 | :--- | :--- | :--- | :--- |
@@ -17,8 +17,11 @@ Configuration is managed via environment variables in `backend/.env` (or Docker 
 | `DEMO_MODE` | Seeds fixed deterministic dataset on startup and halts ATOM polling | No | `false` (Set `true` for demo/testing) |
 | `ATOM_BASE_URL` | ATOM API base incl. `/v1/api` — prod `https://am.amagi.tv/v1/api`, staging `https://am-staging.amagi.tv/v1/api` (Amagi users sign in via SSO; get a Bearer token from the web app or request an API key) | No | If empty, runs random mock generator |
 | `ATOM_API_KEY` | ATOM API key, sent as `X-API-Key` | One auth option | — |
-| `ATOM_BEARER_TOKEN` | Static ATOM JWT, sent as `Authorization: Bearer` (expires) | One auth option | — |
+| `ATOM_REFRESH_TOKEN` | SSO **refresh** token; Sentinel renews access tokens and saves each rotated token to `ATOM_SESSION_FILE` | One auth option | — |
+| `ATOM_BEARER_TOKEN` | SSO **access** token (`eyJ…`, ~24h), sent as `Authorization: Bearer` | One auth option | — |
+| `ATOM_SESSION_FILE` | Rotated refresh-token store (secret, git-ignored) | No | `backend/.atom_session.json` · Docker `/app/data/.atom_session.json` |
 | `ATOM_EMAIL` / `ATOM_PASSWORD` | ATOM user login; token fetched from `/auth/user/login` and renewed | One auth option | — |
+| `ATOM_VIEWS` | Ingest by ATOM saved views: `auto` (region/customer views + Playout Rescue), view ids, or `off` (type mode) | No | `auto` |
 | `ATOM_ALERT_TYPES` | ATOM types to pull. Empty = built-in list (4 TOC types + fault types; excludes `asset_download_waiting`/`asset_submitted`/`asset_queued`). `*` = all | No | empty |
 | `ATOM_ALERT_STATES` | ATOM states to pull (queried one at a time — prod has no `states` filter) | No | `active,snoozed` |
 | `ATOM_LOOKBACK_HOURS` | Only alerts with `issue_start_time` ≥ now − N hours (upcoming always included). `0` = no window | No | `72` |
@@ -27,6 +30,8 @@ Configuration is managed via environment variables in `backend/.env` (or Docker 
 | `ATOM_PRODUCT` | `entity[product]` filter; empty = all products | No | `CP` |
 | `ATOM_PAGE_SIZE` / `ATOM_MAX_PAGES` | Paging for `GET /alerts` (resolution detection is skipped when the page cap is hit) | No | `500` / `20` |
 | `ATOM_CATALOG_REFRESH_HOURS` | Feed catalog refresh interval | No | `6` |
+| `ATOM_CATALOG_MAX_PER_SYNC` | Automations whose catalog is fetched per sync (6 in parallel) | No | `300` |
+| `SESSION_DB_DIR` | Directory of the login session store `sessions.db` | No | `backend/` · Docker `/app/data` |
 | `ATOM_WRITEBACK` | Mirror Ack → ATOM snooze, Reopen → de-snooze, ticket → ATOM comment. Never resolves. | No | `false` |
 | `FRESHDESK_DOMAIN`| Domain of Freshdesk helpdesk | No | e.g. `amagisupport.freshdesk.com` |
 | `FRESHDESK_API_KEY`| API key for Freshdesk | No | If empty, runs deterministic mock (`INC-10001`...) |
@@ -45,38 +50,29 @@ Configuration is managed via environment variables in `backend/.env` (or Docker 
 
 ---
 
-## 2. Urgent Security Notices & Remediation
+## 2. Security Notices & Status
 
-> [!CAUTION]
-> **CRITICAL SECURITY ADVISORY 01: EXPOSED FRESHDESK CREDENTIALS**  
-> An active Freshdesk API key was detected committed to the repository in `backend/.env`.  
-> - **Immediate Action**: Revoke the API key in Freshdesk admin immediately.  
-> - **Remediation**: Issue a rotated key, store it in a secure secret manager (e.g. AWS Secrets Manager, HashiCorp Vault), and inject it into container environments at runtime. Remove all plaintext credentials from `.env` files tracked in git.
+| # | Issue | Status (2026-11-18) |
+|---|---|---|
+| 01 | Freshdesk API key committed in `backend/.env` | **Resolved.** The key was rotated and verified (HTTP 200). `backend/.env` and `sessions.db` were untracked, and the repository history was replaced with a fresh history containing no secrets. The old OneLogin "secret" in history was only the `.env.example` placeholder |
+| 02 | `node_modules` committed | **Resolved.** Untracked and ignored |
+| 03 | nginx did not proxy `/auth/` | **Resolved.** `frontend/nginx.conf` proxies `/api/` and `/auth/` |
+| 04 | Docker images could contain `.env`, databases or host `node_modules` | **Resolved.** `backend/.dockerignore` and `frontend/.dockerignore` exclude them; `env_file` supplies settings at runtime |
+| 05 | ATOM access depends on one person's SSO session (24h tokens, rotation, 403 on playlists) | **Open.** Service API key requested: [`ATOM_API_ACCESS_REQUEST.md`](ATOM_API_ACCESS_REQUEST.md) |
+| 06 | Empty `SESSION_SECRET` fell back to a hard-coded default | **Resolved locally.** A random 96-character secret is set in `backend/.env`. Every deployment must set its own |
 
-> [!WARNING]
-> **SECURITY ADVISORY 02: COMMITTED DEPENDENCY DIRECTORIES**  
-> `backend/node_modules` and `frontend/node_modules` were inadvertently checked into git history.  
-> - **Impact**: Repository bloat (>4.6M lines in git history, sluggish git operations) and risk of tampered vendor packages.  
-> - **Remediation**: Execute `git rm -r --cached */node_modules` and ensure `.gitignore` excludes them across all branches.
-
-> [!WARNING]
-> **BUG ADVISORY 03: NGINX CONFIGURATION MISSING AUTH PROXY**  
-> In `frontend/nginx.conf`, only `/api/` is reverse-proxied to `backend:3001`. `/auth/` is not proxied, falling back to React's `index.html`. In Docker deployments, OneLogin SSO (`/auth/login`, `/auth/callback`, `/auth/me`) will fail with 404 or index HTML payload.  
-> - **Remediation**: Add location block to `nginx.conf`:
->   ```nginx
->   location /auth/ {
->       proxy_pass http://backend:3001;
->       proxy_http_version 1.1;
->       proxy_set_header Host $host;
->       proxy_set_header X-Real-IP $remote_addr;
->   }
->   ```
+Rules that keep it that way:
+- **Never commit** `backend/.env`, `backend/.env.old`, `backend/.atom_session.json`, `backend/data/`, `*.db`. All of these are in `.gitignore`.
+- Never paste tokens or passwords into chats, tickets or screenshots. If one leaks, rotate it.
+- A deleted file stays in git history. If a secret was ever committed, **rotate it**; untracking alone is not enough.
 
 ---
 
 ## 3. How to Run Sentinel
 
 ### Quick Start via NPM (Local Development)
+
+Use **Node 18** (`.nvmrc`; native modules are built for it): `source ~/.nvm/nvm.sh && nvm use 18`. Copy `backend/.env.example` → `backend/.env` and paste the ATOM credential (one of `ATOM_API_KEY`, `ATOM_REFRESH_TOKEN`, `ATOM_BEARER_TOKEN`).
 
 ```bash
 # 1. Install dependencies for root, backend, and frontend
@@ -104,15 +100,15 @@ npm run demo
 ### Production Docker Deployment
 
 ```bash
-# Start both backend and frontend containers
-docker-compose up --build -d
-
-# Check container status
-docker-compose ps
-
-# View backend logs
-docker-compose logs -f backend
+cp backend/.env.example backend/.env    # fill in the ATOM credential, Freshdesk key, SESSION_SECRET
+docker compose up --build -d            # backend :3001, frontend (nginx) :3000
+docker compose ps                       # backend shows (healthy) once /healthz/ready passes
+docker compose logs -f backend          # look for: [sync] Done — issues:… skippedUnmonitored:…
 ```
+- Settings come from `backend/.env` via `env_file`. Container overrides: `DB_PATH`, `SESSION_DB_DIR` and `ATOM_SESSION_FILE`, all under `/app/data`.
+- `backend/data/` (mounted at `/app/data`) holds `atom_dashboard.db`, `sessions.db` and `.atom_session.json`. Back it up, and never commit it.
+- The frontend waits for the backend health check. nginx proxies `/api/` and `/auth/` to `backend:3001`.
+- **Laptops with Cloudflare WARP:** containers get no DNS or internet and published ports don't answer, because WARP captures Docker's 172.x networks. Exclude `172.16.0.0/12` in WARP's split tunnel, or pause WARP.
 
 ---
 
@@ -140,3 +136,21 @@ docker-compose logs -f backend
    - The warning banner shows: `Ticket already created for a previous playlist version today`.
    - Click `View ↗` to view the existing ticket number and verify if the issue was already addressed.
    - Switch to the **Playlist Timeline** tab in the side panel to see chronological playlist publish versions and identify when the previous version was published.
+
+### Scenario D: ATOM sync failing
+1. `curl -s localhost:3001/api/sync/status` → read `lastSyncError` and `atom_auth` (`mode`, `expires_at`, `error`).
+2. `401` or "sign-in expired" → the token expired. Get a new one, or use a refresh token or the API key ([`ATOM_INTEGRATION.md` §3.3](ATOM_INTEGRATION.md#33-getting-a-token-by-hand-until-the-api-key-exists)).
+3. `Token refresh failed (401)` → `ATOM_REFRESH_TOKEN` holds an `eyJ…` access token, or a rotated/revoked refresh token. Move the `eyJ…` value to `ATOM_BEARER_TOKEN`, or get a fresh refresh token.
+4. `ENOTFOUND` / `ETIMEDOUT` / `network error` → no route to ATOM (VPN or WARP, or DNS inside Docker).
+5. Restart the backend after editing `backend/.env`; it is read only at startup.
+
+### Scenario E: An alert in ATOM is missing from Sentinel
+Check in order:
+- Is the alert's `type` in the ingested list (`ATOM_ALERT_TYPES` / default)?
+- `entity.product = CP`?
+- `issue_start_time` within 72h, or upcoming?
+- Is the feed monitored? `GET /api/atom/feeds/<feed_code>` → `monitored`, `data_only`, `headends[].health.monitoring`.
+- Is the ATOM state filter set to "Open"? Resolved alerts are hidden by default.
+
+### Scenario F: Playlist tab says "not allowed" / log shows playlist 403
+The current ATOM role cannot read playlists. Sentinel skips those endpoints for 6h after a 403. This resolves once the service API key includes playlist read scope.

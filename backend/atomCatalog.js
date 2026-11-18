@@ -8,9 +8,9 @@
 const atomApi = require('./atomApi');
 const db      = require('./db');
 
-const REFRESH_HOURS = Number(process.env.ATOM_CATALOG_REFRESH_HOURS) || 6;
-const MAX_PER_RUN   = Number(process.env.ATOM_CATALOG_MAX_PER_SYNC) || 300;
-const CONCURRENCY   = 6;
+const REFRESH_HOURS = Number(process.env.ATOM_CATALOG_REFRESH_HOURS) || 24;
+const MAX_PER_RUN   = Number(process.env.ATOM_CATALOG_MAX_PER_SYNC) || 50;
+const CONCURRENCY   = 1;   // the ATOM rate guard serialises calls anyway
 
 /** Flatten a detailed customer record into atom_feeds rows. */
 function feedsFromCustomer(customer, automation_url) {
@@ -51,7 +51,7 @@ function feedsFromCustomer(customer, automation_url) {
  */
 async function syncCatalog(urls) {
   const out = { fetched: 0, feeds: 0, prefilled: 0, errors: [] };
-  if (!atomApi.isLive()) return out;
+  if (!atomApi.isLive() && !atomApi.isMock()) return out;
   const candidates = urls
     ? [...new Set(urls.filter(Boolean))].filter(u => !db.automationSyncedWithin(u, REFRESH_HOURS))
     : db.getStaleAutomationUrls(REFRESH_HOURS);

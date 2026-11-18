@@ -21,7 +21,7 @@ const SORTERS = {
   time:     (a, b) => startOf(a).localeCompare(startOf(b)),
 };
 
-export default function DashboardPage({ region, onStatsChange, stats }) {
+export default function DashboardPage({ region, family, onStatsChange, stats }) {
   const [issues,      setIssues]      = useState([]);
   const [selectedKey, setSelectedKey] = useState(null);
   const [loading,     setLoading]     = useState(true);
@@ -38,6 +38,7 @@ export default function DashboardPage({ region, onStatsChange, stats }) {
     try {
       const p = new URLSearchParams();
       if (region) p.set('region', region);
+      if (family) p.set('view_family', family);
       Object.entries(filters).forEach(([k, v]) => { if (v !== '' && k !== 'sort') p.set(k, v); });
       const t0 = performance.now();
       const res = await fetch(`/api/issues/upcoming?${p}`, { credentials: 'include' });
@@ -48,9 +49,9 @@ export default function DashboardPage({ region, onStatsChange, stats }) {
       setSREContext({ issues: arr, lastFetch: new Date().toISOString(), filters });
     } catch {}
     finally { if (spinner) setLoading(false); }
-  }, [filters, region]);
+  }, [filters, region, family]);
 
-  useEffect(() => { fetchIssues(true); setSelectedKey(null); setShown({ toc: PAGE, other: PAGE }); }, [filters, region]); // eslint-disable-line
+  useEffect(() => { fetchIssues(true); setSelectedKey(null); setShown({ toc: PAGE, other: PAGE }); }, [filters, region, family]); // eslint-disable-line
   useEffect(() => { setSREContext({ selectedKey, filters }); }, [selectedKey, filters]); // eslint-disable-line
   useEffect(() => {
     pollRef.current = setInterval(() => { fetchIssues(); onStatsChange(); }, 30000);

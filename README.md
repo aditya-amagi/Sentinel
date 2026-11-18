@@ -48,6 +48,9 @@ Comprehensive architectural, operational, and development documentation is locat
 | 🗺️ [**docs/CODEBASE_MAP.md**](docs/CODEBASE_MAP.md) | File-by-file module guide with exports, dependencies, and component tree mappings. |
 | 🛠️ [**docs/OPERATIONS_AND_SECRETS.md**](docs/OPERATIONS_AND_SECRETS.md) | Operational runbooks, environment variable references, triage procedures, and critical security advisories. |
 | 🚀 [**docs/UPGRADE_ROADMAP.md**](docs/UPGRADE_ROADMAP.md) | Technical debt audit, security vulnerabilities, and phased modernization plan toward Sentinel v2. |
+| 🔌 [**docs/ATOM_INTEGRATION.md**](docs/ATOM_INTEGRATION.md) | Everything about the ATOM v1 integration: auth and tokens, ingestion, field mapping, monitored feeds, resolution, playlists, write-back, endpoints, schema, troubleshooting. |
+| 🎫 [**docs/TICKETS_AND_FOLLOWUPS.md**](docs/TICKETS_AND_FOLLOWUPS.md) | Ticket wording per alert type, priority and coverage rules, follow-up templates and API, and the planned reply-detection bot. |
+| 🔑 [**docs/ATOM_API_ACCESS_REQUEST.md**](docs/ATOM_API_ACCESS_REQUEST.md) | Shareable request to the ATOM team for a Sentinel service API key, with scopes, endpoints, load and security. |
 
 ---
 

@@ -25,6 +25,7 @@ const { passport, requireAuthApi, IS_CONFIGURED } = require('./auth');
 const { startSyncScheduler, getSyncStatus, triggerSync } = require('./sync');
 const atomApi      = require('./atomApi');
 const TZ           = require('./atomTime');
+const TT           = require('./ticketText');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -71,6 +72,7 @@ const pf = q => ({
   state: q.state||'',
   date_from: q.date_from||'', date_to: q.date_to||'',
   severity: q.severity||'', atom_state: q.atom_state||'', toc_only: q.toc_only||'',
+  view_family: q.view_family||'', view_id: q.view_id||'',
   sort: q.sort||'',
 });
 
@@ -142,6 +144,11 @@ app.get('/api/demo-status', (_, res) => {
 
 app.get('/api/health',      (_, res) => res.json({ status:'ok', ts: new Date().toISOString() }));
 app.get('/api/regions',     (_, res) => res.json(db.getDistinctRegions()));
+// ATOM view groups for the sidebar (empty in type mode)
+app.get('/api/views', (_, res) => {
+  try { res.json(db.getViewSummary()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
 app.get('/api/issue-types', (_, res) => {
   // Returns fixed enum keys — never dynamic DB values
   res.json(AT.ALERT_KEYS);
@@ -486,12 +493,14 @@ app.post('/api/freshdesk/preview', (req, res) => {
     const payload = db.buildFreshdeskPayload(result.issue, ticket_type || 'customer');
     res.json({
       subject:         payload.subject,
-      description:     payload.description,
+      description:     payload.description,   // full ticket HTML (rendered in the modal preview)
       email:           payload.email,
       cc_emails:       payload.cc_emails,
       customer_name:   payload._meta.contacts.customer_name,
       product_version: payload._meta.contacts.product_version,
       priority:        payload.priority,
+      covers:          payload._meta.covers.length,
+      priority_reason: payload._meta.priority_reason,
       ticket_type,
       is_mock:         freshdesk.isMock(),
     });
@@ -515,20 +524,28 @@ app.post('/api/freshdesk/create', async (req, res) => {
     // Call Freshdesk (or mock)
     const fd = await freshdesk.createTicket(payload);
 
-    // Store in DB
-    const stored = db.storeFreshdeskTicket({
-      atom_issue_id,
-      playlist_id,
-      feed_code:       result.issue.feed_code,
-      issue_type:      result.issue.issue_type,
-      asset_id:        result.issue.asset_id,
-      freshdesk_id:    fd.freshdesk_id,
-      ticket_number:   fd.ticket_number,
-      ticket_url:      fd.ticket_url,
-      ticket_type,
-      subject:         fd.subject,
-      requester_email: fd.requester_email,
-    });
+    // Store in DB — the ticket covers this alert and every related open alert listed in it
+    let stored = null;
+    for (const cov of payload._meta.covers) {
+      const row = cov.atom_issue_id === atom_issue_id && cov.playlist_id === playlist_id
+        ? result.issue
+        : db.getIssueByCompositeKey(cov.atom_issue_id, cov.playlist_id)?.issue;
+      if (!row) continue;
+      const s = db.storeFreshdeskTicket({
+        atom_issue_id:   row.atom_issue_id,
+        playlist_id:     row.playlist_id,
+        feed_code:       row.feed_code,
+        issue_type:      row.issue_type,
+        asset_id:        row.asset_id,
+        freshdesk_id:    fd.freshdesk_id,
+        ticket_number:   fd.ticket_number,
+        ticket_url:      fd.ticket_url,
+        ticket_type,
+        subject:         fd.subject,
+        requester_email: fd.requester_email,
+      });
+      if (row === result.issue) stored = s;
+    }
 
     // Re-run same-day persistence check now that ticket exists
     db.checkAndMarkPersistence(
@@ -538,18 +555,23 @@ app.post('/api/freshdesk/create', async (req, res) => {
       result.issue.playlist_start_time
     );
 
-    // ATOM write-back: leave a comment with the ticket on the alert (never resolves)
+    // ATOM write-back: comment the ticket on every covered alert (never resolves)
     const ref  = fd.ticket_number || fd.freshdesk_id;
-    const atom = await atomApi.commentAlert(atom_issue_id,
-      `Sentinel: Freshdesk #${ref} (${ticket_type}) created by ${currentUser(req)}${fd.ticket_url ? ` — ${fd.ticket_url}` : ''}`);
-    if (!atom.skipped) {
-      db.getDb().prepare(`UPDATE issues SET atom_writeback_error=? WHERE atom_issue_id=? AND playlist_id=?`)
-        .run(atom.ok ? null : atom.error, atom_issue_id, playlist_id);
+    const text = `Sentinel: Freshdesk #${ref} (${ticket_type}) created by ${currentUser(req)}${fd.ticket_url ? ` — ${fd.ticket_url}` : ''}`;
+    let atom = { ok: true, skipped: true };
+    for (const cov of payload._meta.covers) {
+      const r = await atomApi.commentAlert(cov.atom_issue_id, text);
+      if (!r.skipped) {
+        db.getDb().prepare(`UPDATE issues SET atom_writeback_error=? WHERE atom_issue_id=? AND playlist_id=?`)
+          .run(r.ok ? null : r.error, cov.atom_issue_id, cov.playlist_id);
+        if (atom.skipped || atom.ok) atom = r;
+      }
     }
 
     res.json({
       ticket: stored,
       atom,
+      covers:        payload._meta.covers.length,
       freshdesk_id:  fd.freshdesk_id,
       ticket_number: fd.ticket_number,
       ticket_url:    fd.ticket_url,
@@ -558,6 +580,77 @@ app.post('/api/freshdesk/create', async (req, res) => {
     });
   } catch (e) {
     console.error('[/api/freshdesk/create]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Follow-ups ────────────────────────────────────────────────────────────────
+// Templated replies on the issue's original ticket. Also the hook for the planned reply-detection
+// bot: it can call POST /api/freshdesk/followup with {template} once an operator agrees.
+
+function followupContext(atom_issue_id, playlist_id) {
+  const result = db.getIssueByCompositeKey(atom_issue_id, playlist_id);
+  if (!result) return { error: [404, 'Issue not found'] };
+  const parent = db.getParentTicket(atom_issue_id, playlist_id);
+  if (!parent) return { error: [409, 'No Freshdesk ticket to follow up on — create one first'] };
+  const issue = result.issue;
+  // Other alerts on the same ticket give the follow-up the full picture
+  const related = db.getDb().prepare(`
+    SELECT i.* FROM issues i JOIN freshdesk_tickets t
+      ON t.atom_issue_id = i.atom_issue_id AND t.playlist_id = i.playlist_id
+    WHERE t.freshdesk_id = ? AND t.ticket_type != 'followup'
+      AND NOT (i.atom_issue_id = ? AND i.playlist_id = ?)
+    GROUP BY i.atom_issue_id, i.playlist_id`).all(parent.freshdesk_id, atom_issue_id, playlist_id);
+  const contacts = db.resolveContacts(issue.feed_code, issue.issue_type, parent.ticket_type === 'internal' ? 'internal' : 'customer');
+  return { issue, related, parent, contacts, feed: db.getAtomFeed(issue.feed_code), count: db.countFollowups(parent.freshdesk_id) };
+}
+
+app.post('/api/freshdesk/followup/preview', (req, res) => {
+  try {
+    const { atom_issue_id, playlist_id, template, message } = req.body;
+    const ctx = followupContext(atom_issue_id, playlist_id);
+    if (ctx.error) return res.status(ctx.error[0]).json({ error: ctx.error[1] });
+    const suggested = TT.suggestFollowup(ctx.issue, ctx.related);
+    const use = TT.FOLLOWUP_TEMPLATES.some(t => t.key === template) ? template : suggested;
+    const { html } = TT.buildFollowup({ ...ctx, ticket: ctx.parent, template: use, note: message || '', number: ctx.count + 1 });
+    res.json({
+      template: use, suggested, templates: TT.FOLLOWUP_TEMPLATES, html,
+      parent: { ticket_number: ctx.parent.ticket_number, freshdesk_id: ctx.parent.freshdesk_id,
+                ticket_url: ctx.parent.ticket_url, created_at: ctx.parent.created_at, ticket_type: ctx.parent.ticket_type },
+      followups_sent: ctx.count, covers: ctx.related.length + 1, is_mock: freshdesk.isMock(),
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/freshdesk/followup', async (req, res) => {
+  try {
+    const { atom_issue_id, playlist_id, template, message } = req.body;
+    if (!TT.FOLLOWUP_TEMPLATES.some(t => t.key === template)) {
+      return res.status(400).json({ error: `template must be one of: ${TT.FOLLOWUP_TEMPLATES.map(t => t.key).join(', ')}` });
+    }
+    if (template === 'custom' && !String(message || '').trim()) return res.status(400).json({ error: 'message required for a custom follow-up' });
+    const ctx = followupContext(atom_issue_id, playlist_id);
+    if (ctx.error) return res.status(ctx.error[0]).json({ error: ctx.error[1] });
+
+    const number = ctx.count + 1;
+    const { html } = TT.buildFollowup({ ...ctx, ticket: ctx.parent, template, note: String(message || '').trim(), number });
+    const fd = await freshdesk.replyToTicket(ctx.parent.freshdesk_id, html);
+
+    db.storeFreshdeskTicket({
+      atom_issue_id, playlist_id,
+      feed_code: ctx.issue.feed_code, issue_type: ctx.issue.issue_type, asset_id: ctx.issue.asset_id,
+      freshdesk_id: ctx.parent.freshdesk_id,
+      ticket_number: `${ctx.parent.ticket_number || `#${ctx.parent.freshdesk_id}`} · follow-up ${number}`,
+      ticket_url: ctx.parent.ticket_url, ticket_type: 'followup',
+      subject: `Follow-up ${number} (${template})`, requester_email: null,
+    });
+
+    const atom = await atomApi.commentAlert(atom_issue_id,
+      `Sentinel: follow-up ${number} (${template}) sent on Freshdesk ${ctx.parent.ticket_number || ctx.parent.freshdesk_id} by ${currentUser(req)}`);
+
+    res.json({ success: true, number, template, parent: ctx.parent.ticket_number, mock: !!fd.mock, atom });
+  } catch (e) {
+    console.error('[/api/freshdesk/followup]', e.message);
     res.status(500).json({ error: e.message });
   }
 });

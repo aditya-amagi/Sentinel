@@ -17,20 +17,36 @@ function Icon({ d }) {
   );
 }
 
-export default function RegionNav({ regions, active, page, onSelect, onPageChange, stats }) {
+const same = (a, b) => String(a || '').toLowerCase() === String(b || '').toLowerCase();
+
+export default function RegionNav({ regions, active, activeFamily, page, onSelect, onPageChange, stats }) {
   const cfg = useAppConfig();
   const allRegions = [...new Set([...BASE_REGIONS, ...(regions || [])])];
   const [counts, setCounts] = useState({});
+  const [viewGroups, setViewGroups] = useState(null);   // null = not loaded, [] = type mode
+  const [expanded, setExpanded] = useState({});
 
-  // Open-alert counts per region (refreshes whenever global stats change)
+  // ATOM view groups (views mode). Refreshes with global stats.
   useEffect(() => {
+    let off = false;
+    fetch('/api/views', { credentials: 'include' }).then(r => r.json())
+      .then(d => { if (!off) setViewGroups(Array.isArray(d) ? d : []); })
+      .catch(() => { if (!off) setViewGroups([]); });
+    return () => { off = true; };
+  }, [stats?.total, stats?.state_penalty]);
+  useEffect(() => { if (active) setExpanded(e => ({ ...e, [String(active).toLowerCase()]: true })); }, [active]);
+  const usingViews = viewGroups && viewGroups.length > 0;
+
+  // Open-alert counts per region (type mode only; refreshes whenever global stats change)
+  useEffect(() => {
+    if (usingViews) return undefined;
     let cancelled = false;
     Promise.all(allRegions.map(r =>
       fetch(`/api/stats?region=${encodeURIComponent(r)}`, { credentials: 'include' })
         .then(x => x.json()).then(s => [r, s.state_penalty ?? null]).catch(() => [r, null])
     )).then(rows => { if (!cancelled) setCounts(Object.fromEntries(rows)); });
     return () => { cancelled = true; };
-  }, [stats?.total, stats?.state_penalty, allRegions.join()]); // eslint-disable-line
+  }, [stats?.total, stats?.state_penalty, allRegions.join(), usingViews]); // eslint-disable-line
 
   // Badges count alerts that still need action (Penalty), matching the dashboard's KPI
   const totalOpen = stats ? stats.state_penalty ?? null : null;
@@ -50,7 +66,44 @@ export default function RegionNav({ regions, active, page, onSelect, onPageChang
         ))}
       </div>
 
-      {page !== 'settings' && (
+      {page !== 'settings' && usingViews && (
+        <div className="sn-section">
+          <div className="sn-heading">ATOM views</div>
+          <button className={`sn-item ${!active ? 'active' : ''}`} onClick={() => onSelect(null)}>
+            <span className="sn-region-dot all" />
+            <span className="sn-label">All views</span>
+          </button>
+          {viewGroups.map(g => {
+            const isActive = same(active, g.group);
+            const open = expanded[String(g.group).toLowerCase()];
+            const families = g.views.filter(v => v.family);
+            return (
+              <div key={g.group} className="sn-group">
+                <div className={`sn-item sn-group-row ${isActive && !activeFamily ? 'active' : ''}`}>
+                  {families.length > 0
+                    ? <button className={`sn-caret ${open ? 'open' : ''}`} aria-label={open ? `Collapse ${g.group}` : `Expand ${g.group}`} aria-expanded={!!open}
+                        onClick={() => setExpanded(e => ({ ...e, [String(g.group).toLowerCase()]: !open }))}>›</button>
+                    : <span className="sn-caret-spacer" />}
+                  <button className="sn-group-btn" onClick={() => onSelect(g.group)} title={g.views.map(v => v.name).join('\n')}>
+                    <span className="sn-label">{g.group}</span>
+                    {g.penalty > 0 ? <span className="sn-count subtle" title="Alerts needing action">{g.penalty}</span>
+                      : <span className="sn-zero" title="Open alerts">{g.open || ''}</span>}
+                  </button>
+                </div>
+                {open && families.map(v => (
+                  <button key={v.id} className={`sn-item sn-sub ${isActive && same(activeFamily, v.family) ? 'active' : ''}`}
+                    onClick={() => onSelect(g.group, v.family)} title={v.name}>
+                    <span className="sn-label">{v.family}</span>
+                    {v.penalty > 0 ? <span className="sn-count subtle">{v.penalty}</span> : <span className="sn-zero">{v.open || ''}</span>}
+                  </button>
+                ))}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {page !== 'settings' && !usingViews && (
         <div className="sn-section">
           <div className="sn-heading">Regions</div>
           <button className={`sn-item ${!active ? 'active' : ''}`} onClick={() => onSelect(null)}>
@@ -78,6 +131,11 @@ export default function RegionNav({ regions, active, page, onSelect, onPageChang
             </span>
           </div>
         </div>
+        {stats?.sync?.atom_rate?.paused_until && (
+          <div className="sn-warn" title={stats.sync.atom_rate.pause_reason || ''}>
+            ATOM calls paused until {new Date(stats.sync.atom_rate.paused_until).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} — ATOM is struggling
+          </div>
+        )}
         {stats?.sync?.atom_auth?.error && (
           <div className="sn-warn" title={stats.sync.atom_auth.error}>ATOM sign-in expired — update the token</div>
         )}

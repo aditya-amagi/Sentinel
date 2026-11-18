@@ -1,5 +1,9 @@
 'use strict';
 
+// Tests talk to a local fake ATOM: lift the production rate cap so they run instantly
+process.env.ATOM_MAX_REQUESTS_PER_MIN = '100000';
+process.env.ATOM_MAX_CONCURRENCY = '8';
+
 // Write-back ON: PATCH /alerts bodies, the never-resolve guard, and the server routes
 // (Ack → snooze, back to penalty → desnooze, ticket → comment) end to end.
 
@@ -99,10 +103,15 @@ describe('ATOM write-back (ATOM_WRITEBACK=true)', () => {
     const r = await api('/api/freshdesk/create', { method: 'POST', body: { atom_issue_id: '1003', playlist_id: '230001', ticket_type: 'internal' } });
     assert.equal(r.status, 200);
     assert.equal(r.body.atom.ok, true);
-    assert.equal(fake.patches.length, 1);
-    assert.equal(fake.patches[0][0].alert_id, '1003');
-    assert.match(fake.patches[0][0].comment, /^Sentinel: Freshdesk #INC-\d+ \(internal\) created by dev@amagi\.com/);
-    assert.equal(fake.patches[0][0].action, undefined, 'comment only — never resolves');
+    // The ticket covers every open hole on that feed/day (1003 + 1001) → one comment per covered alert
+    assert.equal(r.body.covers, fake.patches.length);
+    assert.ok(fake.patches.map(p => p[0].alert_id).includes('1003'));
+    for (const p of fake.patches) {
+      assert.match(p[0].comment, /^Sentinel: Freshdesk #INC-\d+ \(internal\) created by dev@amagi\.com/);
+      assert.equal(p[0].action, undefined, 'comment only — never resolves');
+    }
+    // Every covered alert is now Ticketed (previously creation never set the state)
+    assert.equal(db.getIssueByCompositeKey('1003', '230001').issue.state, 'ticketed');
   });
 
   it('records a write-back failure without blocking the local change', async () => {
@@ -117,5 +126,35 @@ describe('ATOM write-back (ATOM_WRITEBACK=true)', () => {
     assert.equal(r2.body.atom.ok, false);
     assert.ok(r2.body.issue.atom_writeback_error);
     assert.ok(db.getStats().writeback_errors >= 1);
+  });
+});
+
+describe('Follow-ups', () => {
+  it('previews a suggested template and sends it as a reply on the original ticket', async () => {
+    const pv = await api('/api/freshdesk/followup/preview', { method: 'POST', body: { atom_issue_id: '1003', playlist_id: '230001' } });
+    assert.equal(pv.status, 200, JSON.stringify(pv.body));
+    assert.ok(['reminder', 'urgent', 'aired', 'resolved'].includes(pv.body.suggested));
+    assert.equal(pv.body.followups_sent, 0);
+    assert.match(pv.body.html, /Follow-up #1/);
+
+    fake.patches.length = 0;
+    const sent = await api('/api/freshdesk/followup', { method: 'POST',
+      body: { atom_issue_id: '1003', playlist_id: '230001', template: 'reminder', message: 'Please confirm the ETA.' } });
+    assert.equal(sent.status, 200, JSON.stringify(sent.body));
+    assert.equal(sent.body.number, 1);
+    // ATOM comment was attempted (the fake ATOM is down after the outage test above);
+    // an ATOM failure never blocks the follow-up itself
+    assert.ok(sent.body.atom && !sent.body.atom.skipped);
+    assert.equal(sent.body.atom.ok, false);
+
+    const pv2 = await api('/api/freshdesk/followup/preview', { method: 'POST', body: { atom_issue_id: '1003', playlist_id: '230001', template: 'custom', message: 'x' } });
+    assert.equal(pv2.body.followups_sent, 1);
+    assert.match(pv2.body.html, /Follow-up #2/);
+  });
+
+  it('rejects unknown templates, empty custom messages, and issues without a ticket', async () => {
+    assert.equal((await api('/api/freshdesk/followup', { method: 'POST', body: { atom_issue_id: '1003', playlist_id: '230001', template: 'nope' } })).status, 400);
+    assert.equal((await api('/api/freshdesk/followup', { method: 'POST', body: { atom_issue_id: '1003', playlist_id: '230001', template: 'custom', message: ' ' } })).status, 400);
+    assert.equal((await api('/api/freshdesk/followup/preview', { method: 'POST', body: { atom_issue_id: '1002', playlist_id: '230001' } })).status, 409);
   });
 });

@@ -48,6 +48,9 @@ function startFakeAtom() {
     refreshCount: 0,
     tokenTtlMs: 3600e3,
     revoked: new Set(),     // access tokens that now get 401
+    // Saved views: null = /me/views returns 404 (older ATOM / no access) → Sentinel uses type mode
+    views: null,            // [{id, name}]
+    viewMembers: {},        // view id → [alert_id, …]
     customers: {
       'customer-abc.amagi.tv': {
         name: 'ABC Media', url: 'customer-abc.amagi.tv', days_to_monitor: 3,
@@ -118,6 +121,22 @@ function startFakeAtom() {
         const items = JSON.parse(body || '[]');
         state.patches.push(items);
         return send(200, { items: [], has_next: false });
+      }
+      if (req.method === 'GET' && p === '/me/views') {
+        return state.views ? send(200, { total: state.views.length, limit: 200, offset: 0, views: state.views }) : send(404, { error: 'not found' });
+      }
+      if (req.method === 'GET' && p === '/alerts' && url.searchParams.has('view_id')) {
+        // Prod rule: only these may accompany view_id; issue_start_time is accepted but ignored
+        const allowed = new Set(['view_id', 'state', 'sort_by', 'sort_order', 'group_by', 'issue_start_time', 'end_time', 'limit', 'offset']);
+        if ([...url.searchParams.keys()].some(k => !allowed.has(k))) {
+          return send(400, { error: 'view_id/view_ids/qaaf cannot be combined with other filter parameters; only state, sort_by, sort_order, group_by, issue_start_time, end_time, limit, and offset are allowed' });
+        }
+        const ids = state.viewMembers[url.searchParams.get('view_id')] || [];
+        const st = url.searchParams.get('state');
+        const pool = state.alerts.filter(a => ids.includes(a.alert_id) && (!st || a.state === st))
+          .sort((a, b) => String(b.issue_start_time).localeCompare(String(a.issue_start_time)));
+        const limit = Number(url.searchParams.get('limit')) || 100, offset = Number(url.searchParams.get('offset') || 0);
+        return send(200, { items: pool.slice(offset, offset + limit), has_next: offset + limit < pool.length, limit, offset });
       }
       if (req.method === 'GET' && p === '/alerts') {
         const limit = Number(url.searchParams.get('limit'));
