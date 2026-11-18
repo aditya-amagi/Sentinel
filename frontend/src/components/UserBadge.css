@@ -1,0 +1,57 @@
+.user-badge-wrap { position: relative; }
+
+.user-badge {
+  display: flex; align-items: center; gap: 8px;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid var(--border-strong);
+  color: var(--text-secondary); padding: 5px 12px 5px 6px;
+  border-radius: 20px; cursor: pointer; font-size: 12.5px;
+  font-family: var(--font-sans); transition: all 0.15s;
+}
+.user-badge:hover, .user-badge.active {
+  background: rgba(255,255,255,0.07);
+  border-color: rgba(236,138,79,0.3);
+  color: var(--text-primary);
+}
+
+.user-avatar {
+  width: 24px; height: 24px; border-radius: 50%;
+  background: linear-gradient(135deg, var(--accent) 0%, #c9622e 100%);
+  color: var(--bg-base); font-size: 10px; font-weight: 700;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0; box-shadow: 0 0 10px rgba(236,138,79,0.25);
+}
+.user-name  { font-size: 12.5px; font-weight: 500; max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.user-caret { font-size: 8px; color: var(--text-muted); }
+
+/* ── Dropdown ── */
+.user-dropdown-backdrop { position: fixed; inset: 0; z-index: 99; }
+.user-dropdown {
+  position: absolute; top: calc(100% + 8px); right: 0;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg); min-width: 230px;
+  box-shadow: 0 12px 40px rgba(0,0,0,0.5), 0 0 0 1px rgba(236,138,79,0.05);
+  z-index: 100; overflow: hidden;
+  animation: dd-in 0.15s cubic-bezier(0.16,1,0.3,1);
+}
+@keyframes dd-in { from{transform:translateY(-8px);opacity:0} to{transform:translateY(0);opacity:1} }
+
+.ud-header { padding: 14px 16px; display: flex; flex-direction: column; gap: 3px; }
+.ud-name  { font-size: 13.5px; font-weight: 600; color: var(--text-primary); }
+.ud-email { font-size: 11.5px; font-family: var(--font-mono); color: var(--text-muted); }
+.ud-bypass-badge {
+  margin-top: 5px; font-size: 9px; font-family: var(--font-mono); font-weight: 700;
+  letter-spacing: 0.08em; color: var(--amber);
+  background: rgba(231,177,79,0.10); border: 1px solid rgba(231,177,79,0.28);
+  padding: 2px 7px; border-radius: 20px; align-self: flex-start;
+}
+.ud-divider { height: 1px; background: var(--border-strong); }
+.ud-logout {
+  display: flex; align-items: center; gap: 9px; width: 100%;
+  padding: 11px 16px; background: none; border: none;
+  color: var(--text-secondary); font-size: 13px;
+  font-family: var(--font-sans); cursor: pointer; transition: all 0.12s; text-align: left;
+}
+.ud-logout:hover { background: rgba(229,89,77,0.08); color: var(--red); }
+.ud-logout-icon { font-size: 14px; }

@@ -1,0 +1,14 @@
+{
+  "name": "atom-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "install:all": "npm --prefix backend install && npm --prefix frontend install",
+    "dev:backend": "npm --prefix backend run dev",
+    "dev:frontend": "npm --prefix frontend start",
+    "start:backend": "npm --prefix backend start",
+    "demo": "DEMO_MODE=true npm --prefix backend start",
+    "docker:up": "docker-compose up --build",
+    "docker:down": "docker-compose down"
+  }
+}

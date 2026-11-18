@@ -1,0 +1,79 @@
+.loading-screen {
+  position: fixed; inset: 0;
+  background: var(--bg-base);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 9999;
+  animation: ls-fadein 0.3s ease;
+}
+@keyframes ls-fadein { from{opacity:0} to{opacity:1} }
+
+.ls-content {
+  display: flex; flex-direction: column;
+  align-items: center; gap: 20px; width: 300px;
+}
+
+/* ── Pulse icon ── */
+.ls-icon {
+  width: 80px; height: 80px;
+  display: flex; align-items: center; justify-content: center;
+  position: relative;
+}
+
+/* Outer rotating dashed ring */
+.ls-ring-outer {
+  transform-origin: 24px 24px;
+  animation: rotate 8s linear infinite;
+}
+/* Middle breathing ring */
+.ls-ring-mid {
+  transform-origin: 24px 24px;
+  animation: breathe 2s ease-in-out infinite;
+}
+/* Core dot pulse */
+.ls-core-dot {
+  animation: core-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes rotate     { to { transform: rotate(360deg); } }
+@keyframes breathe    { 0%,100%{opacity:0.4} 50%{opacity:1} }
+@keyframes core-pulse { 0%,100%{opacity:1;r:3} 50%{opacity:0.6;r:2} }
+
+/* ── Brand ── */
+.ls-brand {
+  display: flex; flex-direction: column; align-items: center; gap: 5px;
+}
+.ls-title {
+  font-family: var(--font-mono); font-size: 26px; font-weight: 700;
+  color: var(--text-primary); letter-spacing: 0.2em;
+}
+.ls-subtitle {
+  font-size: 11px; color: var(--text-muted);
+  letter-spacing: 0.06em; text-align: center; line-height: 1.5;
+}
+
+/* ── Progress bar ── */
+.ls-bar-track {
+  width: 100%; height: 2px;
+  background: var(--border); border-radius: 2px; overflow: hidden;
+}
+.ls-bar-fill {
+  height: 100%; border-radius: 2px;
+  background: var(--accent);
+  box-shadow: 0 0 8px var(--accent-glow);
+  animation: bar-slide 2.2s ease-in-out infinite;
+}
+@keyframes bar-slide {
+  0%   { width:0%;  margin-left:0%; }
+  40%  { width:60%; margin-left:0%; }
+  60%  { width:60%; margin-left:40%; }
+  100% { width:0%;  margin-left:100%; }
+}
+
+/* ── Status message ── */
+.ls-message {
+  font-family: var(--font-mono); font-size: 12px;
+  color: var(--accent); letter-spacing: 0.04em;
+  min-height: 18px; text-align: center;
+  animation: msg-fade 0.5s ease;
+}
+@keyframes msg-fade { from{opacity:0;transform:translateY(4px)} to{opacity:1;transform:translateY(0)} }

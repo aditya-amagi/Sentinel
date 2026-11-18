@@ -1,0 +1,132 @@
+.history-page {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+  background: var(--bg-base);
+}
+
+/* ── Column shared styles ── */
+.hist-feeds-col,
+.hist-playlists-col,
+.hist-issues-col {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-right: 1px solid var(--border);
+}
+.hist-feeds-col     { width: 200px; min-width: 200px; flex-shrink: 0; }
+.hist-playlists-col { width: 260px; min-width: 260px; flex-shrink: 0; }
+.hist-issues-col    { flex: 1; border-right: none; }
+
+.hist-col-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 14px 10px;
+  font-size: 11px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.08em; color: var(--text-muted);
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.hist-count {
+  font-family: var(--font-mono); font-size: 11px;
+  background: var(--bg-elevated); border: 1px solid var(--border);
+  color: var(--text-secondary); padding: 1px 6px; border-radius: 10px;
+}
+
+/* ── Feed search ── */
+.hist-search-wrap { padding: 8px 10px; border-bottom: 1px solid var(--border); flex-shrink:0; }
+.hist-search {
+  width: 100%; background: var(--bg-elevated); border: 1px solid var(--border);
+  color: var(--text-primary); font-family: var(--font-mono); font-size: 12px;
+  padding: 5px 8px; border-radius: var(--radius); outline: none;
+}
+.hist-search:focus { border-color: var(--accent); }
+.hist-search::placeholder { color: var(--text-muted); }
+
+/* ── Feed list ── */
+.hist-feed-list  { flex: 1; overflow-y: auto; }
+.hist-pl-list    { flex: 1; overflow-y: auto; }
+
+.hist-feed-item {
+  display: flex; align-items: center; justify-content: space-between;
+  width: 100%; padding: 9px 14px;
+  background: none; border: none; cursor: pointer;
+  border-bottom: 1px solid var(--border);
+  transition: background 0.1s;
+}
+.hist-feed-item:hover   { background: var(--bg-hover); }
+.hist-feed-item.active  { background: var(--bg-active); border-left: 2px solid var(--accent); }
+
+.hist-feed-code { font-size: 12.5px; font-weight: 500; color: var(--text-primary); }
+
+.hist-region-badge {
+  font-size: 9px; font-family: var(--font-mono); font-weight: 600;
+  letter-spacing: 0.08em; padding: 1px 5px; border-radius: 2px;
+}
+.rc-teal   { background: var(--green-dim);  color: var(--green); }
+.rc-blue   { background: var(--accent-dim); color: var(--accent); }
+.rc-purple { background: var(--purple-dim); color: var(--purple); }
+.rc-amber  { background: var(--amber-dim);  color: var(--amber); }
+
+/* ── Playlist list ── */
+.hist-pl-item {
+  display: flex; align-items: center; justify-content: space-between;
+  width: 100%; padding: 10px 14px;
+  background: none; border: none; cursor: pointer;
+  border-bottom: 1px solid var(--border);
+  transition: background 0.1s;
+  gap: 8px;
+}
+.hist-pl-item:hover  { background: var(--bg-hover); }
+.hist-pl-item.active { background: var(--bg-active); border-left: 2px solid var(--accent); }
+
+.hist-pl-main { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
+.hist-pl-time { font-size: 13px; color: var(--text-primary); font-weight: 500; }
+.hist-pl-id   { font-size: 11px; color: var(--text-muted); }
+.text-muted   { color: var(--text-muted); }
+
+.hist-pl-badges { display: flex; gap: 4px; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; }
+.hist-pl-badge {
+  font-size: 10px; font-family: var(--font-mono);
+  padding: 1px 5px; border-radius: 2px;
+}
+.hist-pl-badge.issues   { background: var(--bg-elevated); color: var(--text-secondary); }
+.hist-pl-badge.penalty  { background: var(--amber-dim);   color: var(--amber); }
+.hist-pl-badge.ticketed { background: var(--green-dim);   color: var(--green); }
+
+/* ── Issues body ── */
+.hist-issues-body { display: flex; flex: 1; overflow: hidden; }
+.hist-issues-list { flex: 1; overflow-y: auto; }
+.hist-issues-list.has-sidebar { width: 300px; min-width: 300px; flex: none; border-right: 1px solid var(--border); }
+.hist-detail-panel { flex: 1; overflow: hidden; display: flex; flex-direction: column; border-left: 1px solid var(--border); background: var(--bg-surface); }
+
+.hist-issue-row {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 11px 14px; border-bottom: 1px solid var(--border);
+  cursor: pointer; transition: background 0.1s; gap: 10px;
+}
+.hist-issue-row:hover    { background: var(--bg-hover); }
+.hist-issue-row.selected { background: var(--bg-active); border-left: 2px solid var(--accent); }
+.hist-issue-row.has-warning { border-left: 2px solid var(--amber); }
+.hist-issue-row.has-warning.selected { border-left: 2px solid var(--accent); }
+
+.hir-left  { display: flex; align-items: flex-start; gap: 8px; flex: 1; min-width: 0; }
+.hir-right { display: flex; align-items: center; gap: 7px; flex-shrink: 0; }
+
+.hir-dot { width:7px; height:7px; border-radius:50%; flex-shrink:0; margin-top:4px; }
+.hir-dot.open { background:var(--red); box-shadow:0 0 5px var(--red); }
+.hir-dot.ack  { background:var(--text-muted); }
+
+.hir-info  { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.hir-type  { font-size: 13px; color: var(--text-primary); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.hir-asset { font-size: 11px; color: var(--text-muted); }
+
+.hir-warn-badge { font-size: 12px; color: var(--amber); }
+.hir-ticket { font-size: 11px; color: var(--accent); }
+.hir-count  { font-family: var(--font-mono); font-size: 13px; font-weight: 600; color: var(--text-secondary); min-width: 16px; text-align: right; }
+.hir-time   { font-size: 11px; color: var(--text-muted); }
+
+.hist-empty-msg { padding: 28px 16px; font-size: 13px; color: var(--text-muted); text-align: center; }
+.hist-loading   { display: flex; justify-content: center; padding: 32px; }
+.loading-spinner { width:22px; height:22px; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:spin 0.8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }

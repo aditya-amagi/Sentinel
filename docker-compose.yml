@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./backend/data:/app/data
+    environment:
+      - PORT=3001
+      - ATOM_BASE_URL=${ATOM_BASE_URL:-}
+      - ATOM_API_KEY=${ATOM_API_KEY:-}
+      - ATOM_REFRESH_TOKEN=${ATOM_REFRESH_TOKEN:-}
+      - ATOM_BEARER_TOKEN=${ATOM_BEARER_TOKEN:-}
+      # Rotated refresh tokens must survive container restarts → keep the session on the volume
+      - ATOM_SESSION_FILE=/app/data/.atom_session.json
+      - DB_PATH=/app/data/atom_dashboard.db
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  db_data:

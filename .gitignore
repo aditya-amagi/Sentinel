@@ -1,0 +1,47 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+backend/node_modules/
+
+# Environment files
+.env
+frontend/.env
+backend/.env
+
+# SQLite Databases
+*.db
+*.db-shm
+*.db-wal
+backend/atom_dashboard.db*
+backend/sessions.db*
+
+# Build outputs
+dist/
+build/
+frontend/dist/
+frontend/build/
+backend/dist/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS / Editor
+.DS_Store
+.vscode/
+.idea/
+
+# Coverage
+coverage/
+
+# Optional
+package-lock.json
+
+# ATOM SSO session (rotating refresh token) — secret
+backend/.atom_session.json
+backend/data/.atom_session.json
+backend/sessions.db
+backend/.env.old
