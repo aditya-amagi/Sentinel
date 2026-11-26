@@ -17,6 +17,8 @@ const clean = () => { for (const f of [TEST_DB, `${TEST_DB}-wal`, `${TEST_DB}-sh
 const recent = h => new Date(Date.now() - h * 3600e3).toISOString();
 let fake, db, sync, atom, app, server, base;
 const get = p => fetch(base + p).then(async r => ({ status: r.status, body: await r.json() }));
+const post = (p, body) => fetch(base + p, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+  .then(async r => ({ status: r.status, body: await r.json() }));
 const has = id => !!db.getDb().prepare('SELECT 1 FROM issues WHERE atom_issue_id=?').get(id);
 
 describe('ATOM saved views', () => {
@@ -45,7 +47,7 @@ describe('ATOM saved views', () => {
     clean();
     Object.assign(process.env, { ATOM_BASE_URL: fake.baseUrl, ATOM_API_KEY: 'k', ATOM_VIEWS: 'auto', ATOM_PAGE_SIZE: '2',
       DB_PATH: TEST_DB, NODE_ENV: 'test', SESSION_SECRET: 'x' });
-    for (const k of ['ATOM_WRITEBACK', 'DEMO_MODE', 'ATOM_ALERT_TYPES', 'ATOM_REFRESH_TOKEN', 'ATOM_BEARER_TOKEN']) delete process.env[k];
+    for (const k of ['ATOM_WRITEBACK', 'DEMO_MODE', 'ATOM_ALERT_TYPES', 'ATOM_REFRESH_TOKEN', 'ATOM_BEARER_TOKEN', 'FRESHDESK_DOMAIN', 'FRESHDESK_API_KEY']) delete process.env[k];
     atom = require('../atomApi');
     db = require('../db');
     sync = require('../sync');
@@ -115,6 +117,16 @@ describe('ATOM saved views', () => {
     assert.equal(r.body.issue.atom_issue_id, 'NP-1');
     assert.equal(r.body.issue.playlist_id, '');
     assert.equal((await get('/api/issues/NP-1/playlist/-/snooze-options')).status, 200);
+
+    // Ticketing works for it too (mock Freshdesk): preview → create → follow-up
+    const key = { atom_issue_id: 'NP-1', playlist_id: '', ticket_type: 'internal' };
+    assert.equal((await post('/api/freshdesk/preview', key)).status, 200);
+    const created = await post('/api/freshdesk/create', key);
+    assert.equal(created.status, 200, JSON.stringify(created.body));
+    assert.equal(db.getIssueByCompositeKey('NP-1', '').issue.state, 'ticketed');
+    const fu = await post('/api/freshdesk/followup/preview', { atom_issue_id: 'NP-1', playlist_id: '', template: 'reminder' });
+    assert.equal(fu.status, 200, JSON.stringify(fu.body));
+    assert.equal((await post('/api/freshdesk/preview', { atom_issue_id: 'NP-1' })).status, 400, 'missing playlist_id still rejected');
     db.getDb().prepare("DELETE FROM issues WHERE atom_issue_id='NP-1'").run();
   });
 

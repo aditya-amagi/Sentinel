@@ -159,8 +159,12 @@ describe('ATOM sync → Sentinel', () => {
     const p = db.buildFreshdeskPayload(issue, 'internal');
     assert.equal(p.priority, 4);
     assert.match(p.subject, /Tarang Media Seq Stall - ABC Movies HD \(AMG01579C1\)/);
-    for (const s of ['ABC Movies HD', 'Critical', 'Media seq stall', '00:05:00', 'fa_001', 'customer-abc.amagi.tv', '1004', 'Asia/Kolkata', 'Technical details'])
+    for (const s of ['ABC Movies HD', 'Critical', 'Media seq stall', '00:05:00', 'fa_001', 'customer-abc.amagi.tv', 'Asia/Kolkata', 'Technical details'])
       assert.ok(p.description.includes(s), `description should include ${s}`);
+    // No monitoring-system name, alert IDs or alert state inside the ticket
+    assert.ok(!/\batom\b/i.test(p.description), 'no "ATOM" in the ticket');
+    assert.ok(!p.description.includes('1004'), 'no alert ID in the ticket');
+    assert.ok(!/alert ID|ATOM state/i.test(p.description));
   });
 
   it('one ticket covers every open alert of the same type on the feed and broadcast day', () => {

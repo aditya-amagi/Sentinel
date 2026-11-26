@@ -248,10 +248,9 @@ function buildTicket({ issue, related = [], feed = null, contacts = {}, ticketTy
 
   const technical = ticketType === 'internal' ? `<p style="${S.h}">Technical details</p>` + fieldTable([
     ['Severity', esc(issue.severity && issue.severity.charAt(0).toUpperCase() + issue.severity.slice(1))],
-    ['ATOM alert', esc(issue.alert_name)],
-    ['ATOM type', esc(issue.raw_type || issue.issue_type)],
-    ['ATOM alert ID(s)', lines(items.map(i => i.atom_issue_id))],
-    ['ATOM state', esc(issue.consolidated_status)],
+    // No monitoring-system name, alert IDs or alert state in the ticket itself
+    ['Alert', esc(issue.alert_name)],
+    ['Alert type', esc(issue.raw_type || issue.issue_type)],
     ['AMG ID', esc(issue.amg_id || feed?.amg_id)],
     ['Headend', esc(issue.headend_code)],
     ['Product / service', esc([issue.product, issue.entity_service].filter(Boolean).join(' / '))],
@@ -272,7 +271,6 @@ function buildTicket({ issue, related = [], feed = null, contacts = {}, ticketTy
     technical,
     `<p style="${S.p}">We keep monitoring this channel. As soon as the fix is published our alert clears automatically and we will confirm it on this ticket.</p>`,
     `<p style="${S.p}">Regards,<br/>Amagi TOC Team<br/><span style="color:#777;">24×7 Broadcast Operations</span></p>`,
-    `<p style="${S.small}">Reference: ${esc(items.map(i => i.atom_issue_id).join(', '))} · raised via Sentinel</p>`,
   ].join('\n');
 
   // Priority: severity, raised to Urgent when it is on-air now or airs within 2 hours
@@ -371,7 +369,7 @@ function buildFollowup({ issue, related = [], feed = null, contacts = {}, ticket
     note ? `<p style="${S.p}">${esc(note).replace(/\n/g, '<br/>')}</p>` : '',
     status,
     `<p style="${S.p}">Regards,<br/>Amagi TOC Team<br/><span style="color:#777;">24×7 Broadcast Operations</span></p>`,
-    `<p style="${S.small}">Follow-up #${Number(number) || 1} · Reference: ${esc(items.map(i => i.atom_issue_id).join(', '))}</p>`,
+    `<p style="${S.small}">Follow-up #${Number(number) || 1}</p>`,
   ].filter(Boolean).join('\n');
 
   return { html };

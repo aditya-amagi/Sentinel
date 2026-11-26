@@ -58,5 +58,6 @@ describe('ticketText', () => {
       ticket: { ticket_number: 'INC-123', created_at: '2026-11-17 05:00:00' }, template: 'urgent', note: 'Call us <now>', number: 2, now: NOW });
     for (const s of ['INC-123', 'Urgent:', 'rescue content will air', 'Follow-up #2', 'Call us &lt;now&gt;', 'Status in our monitoring'])
       assert.ok(html.includes(s), `missing: ${s}`);
+    assert.ok(!/\batom\b|Reference:/i.test(html), 'no ATOM wording or alert-ID reference in follow-ups');
   });
 });

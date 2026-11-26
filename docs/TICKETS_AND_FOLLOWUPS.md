@@ -15,13 +15,14 @@ Every customer ticket answers, in this order: **what is wrong → what happens o
 | What + impact | "We are raising this ticket on your behalf. There is an unfilled gap (hole) in the published playlist for **CazeTV 3 (CAZE3)**. If the gap is not filled, **rescue content will go on-air** for its full duration." |
 | Time to air (highlighted) | "**Airs at 2026-11-17 08:46:30 UTC / 2026-11-17 14:16:30 IST**, 1 h 47 min from now." On-air now and already-aired variants exist too |
 | What we need from you | Numbered steps per alert type, always ending "Reply to this ticket once it is done…" |
-| Details table | Channel (name + code), Customer, Broadcast date, Playlist ID(s), timing UTC + channel-local, Duration (hh:mm:ss), Asset ID, Automation URL (link), **Open in CloudPort** (direct playlist link), ATOM details |
+| Details table | Channel (name + code), Customer, Broadcast date, Playlist ID(s), timing UTC + channel-local, Duration (hh:mm:ss), Asset ID, Automation URL (link), **Open in CloudPort** (direct playlist link) |
 | Affected items | When the ticket covers several alerts: one row each (UTC, local, duration, asset), plus **total hole duration** |
 | What happens next | "We keep monitoring this channel. As soon as the fix is published our alert clears automatically and we will confirm it on this ticket." |
 | Sign-off | `Amagi TOC Team · 24×7 Broadcast Operations` |
-| Reference | Small grey line with the ATOM alert IDs |
 
-**Internal tickets** open with "Hi team, Raising this internally for investigation…" and add a **Technical details** table: severity, ATOM alert name/type/IDs/state, AMG ID, headend, product/service, dedup key.
+**Internal tickets** open with "Hi team, Raising this internally for investigation…" and add a **Technical details** table: severity, alert name and type, AMG ID, headend, product/service, dedup key.
+
+**No monitoring-system internals in tickets**: tickets and follow-ups never mention ATOM and carry no ATOM alert IDs or alert state (enforced by tests).
 
 All ATOM-supplied text is HTML-escaped. Styling is inline, because email clients strip `<style>`.
 

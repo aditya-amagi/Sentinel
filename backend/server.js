@@ -387,8 +387,10 @@ app.get('/api/tickets/check', (req, res) => {
 // Create ticket (always allowed — warning already shown in UI)
 app.post('/api/tickets', (req, res) => {
   try {
-    const { atom_issue_id, playlist_id, feed_code, issue_type, asset_id, ticket_number, ticket_link } = req.body;
-    if (!atom_issue_id || !playlist_id) return res.status(400).json({error:'atom_issue_id and playlist_id required'});
+    const { atom_issue_id, playlist_id: rawPl, feed_code, issue_type, asset_id, ticket_number, ticket_link } = req.body;
+    const playlist_id = rawPl === null ? '' : rawPl;
+    // playlist_id may be '' (No Playlist, live/ingest alerts) — only a missing value is an error
+    if (!atom_issue_id || playlist_id === undefined) return res.status(400).json({ error: 'atom_issue_id and playlist_id required' });
     const ticket = db.createTicket({ atom_issue_id, playlist_id, feed_code, issue_type, asset_id, ticket_number, ticket_link });
     res.json({ ticket });
   } catch(e) { res.status(500).json({error:e.message}); }
@@ -488,8 +490,10 @@ app.get('/api/settings/issue-types', (req, res) => {
 // ── Ticket preview (build payload without creating) ───────────────────────────
 app.post('/api/freshdesk/preview', (req, res) => {
   try {
-    const { atom_issue_id, playlist_id, ticket_type } = req.body;
-    if (!atom_issue_id || !playlist_id) return res.status(400).json({ error: 'atom_issue_id and playlist_id required' });
+    const { atom_issue_id, playlist_id: rawPl, ticket_type } = req.body;
+    const playlist_id = rawPl === null ? '' : rawPl;
+    // playlist_id may be '' (No Playlist, live/ingest alerts) — only a missing value is an error
+    if (!atom_issue_id || playlist_id === undefined) return res.status(400).json({ error: 'atom_issue_id and playlist_id required' });
     const result = db.getIssueByCompositeKey(atom_issue_id, playlist_id);
     if (!result) return res.status(404).json({ error: 'Issue not found' });
     const payload = db.buildFreshdeskPayload(result.issue, ticket_type || 'customer');
@@ -512,8 +516,10 @@ app.post('/api/freshdesk/preview', (req, res) => {
 // ── Create Freshdesk ticket ───────────────────────────────────────────────────
 app.post('/api/freshdesk/create', async (req, res) => {
   try {
-    const { atom_issue_id, playlist_id, ticket_type } = req.body;
-    if (!atom_issue_id || !playlist_id) return res.status(400).json({ error: 'atom_issue_id and playlist_id required' });
+    const { atom_issue_id, playlist_id: rawPl, ticket_type } = req.body;
+    const playlist_id = rawPl === null ? '' : rawPl;
+    // playlist_id may be '' (No Playlist, live/ingest alerts) — only a missing value is an error
+    if (!atom_issue_id || playlist_id === undefined) return res.status(400).json({ error: 'atom_issue_id and playlist_id required' });
     if (!ticket_type || !['customer','internal'].includes(ticket_type)) {
       return res.status(400).json({ error: 'ticket_type must be "customer" or "internal"' });
     }
