@@ -157,6 +157,11 @@ describe('atomApi (ATOM v1, read-only)', () => {
     assert.match(n.source_url, /^https:\/\/customer\.cloudport/);
   });
 
+  it('never renews or fetches a token by itself unless ATOM_ALLOW_TOKEN_RENEWAL=true', () => {
+    // This file runs with ATOM_API_KEY; the mode check is what matters
+    assert.equal(atom.authInfo().renewal, false);
+  });
+
   it('falls back sensibly on sparse alerts', () => {
     const { normalizeAlert, alertToOccurrence, regionFromCloud } = atom._internal;
     const n = normalizeAlert({ alert_id: 7, type: 'hole_in_the_playlist', created_at: '2026-11-17T23:00:00Z',

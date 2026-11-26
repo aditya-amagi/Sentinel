@@ -33,9 +33,9 @@ export function TriagePill({ state }) {
   return <span className={`pill triage triage-${state}`} title={m.desc}>{m.label}</span>;
 }
 
-export function TypeLabel({ type, rawType }) {
+export function TypeLabel({ type, rawType, toc }) {
   return (
-    <span className={`type-label ${isToc(type) ? 'toc' : 'other'}`} title={rawType && rawType !== type ? rawType : undefined}>
+    <span className={`type-label ${(toc ?? isToc(type)) ? 'toc' : 'other'}`} title={rawType && rawType !== type ? rawType : undefined}>
       {alertLabel(type)}
     </span>
   );

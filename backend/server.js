@@ -548,12 +548,7 @@ app.post('/api/freshdesk/create', async (req, res) => {
     }
 
     // Re-run same-day persistence check now that ticket exists
-    db.checkAndMarkPersistence(
-      atom_issue_id, playlist_id,
-      result.issue.feed_code, result.issue.issue_type,
-      result.issue.asset_id, result.issue.playlist_date,
-      result.issue.playlist_start_time
-    );
+    db.checkAndMarkPersistence(atom_issue_id, playlist_id);
 
     // ATOM write-back: comment the ticket on every covered alert (never resolves)
     const ref  = fd.ticket_number || fd.freshdesk_id;

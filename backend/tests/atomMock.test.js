@@ -15,7 +15,8 @@ describe('mock mode', () => {
   before(async () => {
     clean();
     for (const k of ['ATOM_BASE_URL', 'ATOM_API_KEY', 'ATOM_REFRESH_TOKEN', 'ATOM_BEARER_TOKEN', 'DEMO_MODE', 'ATOM_VIEWS']) delete process.env[k];
-    Object.assign(process.env, { DB_PATH: TEST_DB, NODE_ENV: 'test' });
+    // Generated data (a local production snapshot, if any, must not leak into tests)
+    Object.assign(process.env, { DB_PATH: TEST_DB, NODE_ENV: 'test', ATOM_MOCK_SNAPSHOT: 'off' });
     // Any outbound HTTP in mock mode is a bug
     for (const m of [require('http'), require('https')]) { const o = m.request; m.request = function (...a) { calls++; return o.apply(this, a); }; }
     atom = require('../atomApi');
@@ -39,7 +40,8 @@ describe('mock mode', () => {
       assert.equal(r.region, r.view_group);
     }
     assert.ok(rows.some(r => r.issue_type === 'HOLE' || r.issue_type === 'MISSING_IN_CLOUD'), 'TOC types present');
-    assert.ok(rows.some(r => r.issue_type === 'player_rescue_detected_alert'), 'Playout Rescue present');
+    assert.ok(!rows.some(r => r.issue_type === 'player_rescue_detected_alert'), 'Playout Rescue not ingested');
+    assert.ok(rows.some(r => JSON.parse(r.atom_view_names || '[]').includes('Service Alerts')), 'Service Alerts present');
   });
 
   it('builds the feed catalog and view summary offline', () => {

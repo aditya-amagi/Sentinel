@@ -5,7 +5,22 @@ const db          = require('./db');
 
 // Load budgets (ATOM went down under ~4k requests in 2 h — keep these conservative).
 // The global rate cap in atomApi (ATOM_MAX_REQUESTS_PER_MIN, default 20) applies on top.
-const SYNC_INTERVAL_MIN = Math.min(60, Math.max(5, Number(process.env.ATOM_SYNC_INTERVAL_MIN) || 10));
+// Each lane of ATOM views syncs on its own interval (minutes, 5–120):
+//   asset    → "<Group> Asset [Alerts]" views          ATOM_SYNC_ASSET_MIN    (default 15)
+//   schedule → "<Group> Schedule [Alerts]" views       ATOM_SYNC_SCHEDULE_MIN (default 30)
+//   other    → Live views, Service Alerts, …          ATOM_SYNC_OTHER_MIN    (default 15)
+// The scheduler ticks every 5 min and fetches only the lanes that are due (lanes due together share
+// one run). Type mode (no views) syncs everything on the shortest interval.
+const laneMin = (v, d) => Math.min(120, Math.max(5, Number(v) || d));
+const LANE_INTERVAL_MIN = {
+  asset:    laneMin(process.env.ATOM_SYNC_ASSET_MIN, 15),
+  schedule: laneMin(process.env.ATOM_SYNC_SCHEDULE_MIN, 30),
+  other:    laneMin(process.env.ATOM_SYNC_OTHER_MIN, 15),
+};
+const TICK_MIN = 5;
+const SYNC_INTERVAL_MIN = Math.min(...Object.values(LANE_INTERVAL_MIN));
+const laneMetaKey = lane => `last_atom_sync_${lane}`;
+const lastLaneSync = {};   // lane → ISO time of its last successful sync
 // GET /alerts/{id} checks per sync for alerts that dropped out of the fetch (oldest first)
 const RESOLVE_CHECK_LIMIT = Number(process.env.ATOM_RESOLVE_CHECKS_PER_SYNC) || 25;
 const RESOLVE_CONCURRENCY = 1;
@@ -17,7 +32,9 @@ const playlistLookedUp = new Map(); // feed__date → last lookup ms
 let isSyncing=false, lastSyncTime=null, lastSyncStatus='never', lastSyncError=null;
 let lastCounts = { issues: 0, occurrences: 0, playlist_versions: 0, resolved: 0, catalog_feeds: 0, truncated: false };
 
-async function sync() {
+/** lanes: which view lanes to fetch (subset of atomApi.LANES); omitted = all (manual sync, tests). */
+async function sync({ lanes } = {}) {
+  lanes = lanes && lanes.length ? lanes : atomApi.LANES;
   // In demo mode, data is seeded directly — no need to poll ATOM
   if (process.env.DEMO_MODE === 'true') {
     lastSyncTime   = new Date().toISOString();
@@ -31,12 +48,18 @@ async function sync() {
     return;
   }
   isSyncing = true; lastSyncStatus = 'running'; lastSyncError = null;
-  console.log(`[sync] Start ${new Date().toISOString()}`);
+  const partial = lanes.length < atomApi.LANES.length;
+  console.log(`[sync] Start ${new Date().toISOString()} (${partial ? lanes.join(' + ') : 'all lanes'})`);
   try {
     const feedLookup = fc => db.getAtomFeed(fc);
-    let { issues, truncated, mode, viewErrors, failedViewIds = [] } = await atomApi.fetchAlerts({ feedLookup });
+    let { issues, truncated, mode, viewErrors, failedViewIds = [], fetchedViewIds = [] } =
+      await atomApi.fetchAlerts({ feedLookup, lanes, priorViews: db.getPriorViewMembership() });
     const viewsMode = mode === 'views';
     if (viewsMode) db.saveAtomViews(atomApi.getViewList());
+    // Selected views not fetched this run (other lanes, or failed): their alerts are left alone
+    const fetchedSet = new Set(fetchedViewIds);
+    const unfetchedViewIds = viewsMode
+      ? atomApi.getViewList().filter(v => v.selected && !fetchedSet.has(v.id)).map(v => v.id) : [];
 
     // Refresh the feed catalog for automations on these alerts, then re-derive
     // region / broadcast date with the feeds' real timezones.
@@ -48,7 +71,10 @@ async function sync() {
     const fetchedIds = new Set(issues.map(i => i.id));
     let skippedUnmonitored = 0, purged = 0;
     if (viewsMode) {
-      if (!truncated) purged = db.purgeUntouchedNotIn(fetchedIds, failedViewIds);
+      if (!truncated) {
+        purged = db.purgeUntouchedNotIn(fetchedIds, unfetchedViewIds);
+        db.pruneViewMembership(fetchedIds, fetchedViewIds);
+      }
     } else {
       const before = issues.length;
       issues = issues.filter(i => db.isAlertMonitored(i));
@@ -105,17 +131,19 @@ async function sync() {
       db.updateOccurrenceCount(iss.id, iss.playlist_id);
 
       // Check if a same-day previous playlist already had a ticket
-      db.checkAndMarkPersistence(
-        iss.id, iss.playlist_id, iss.feed_code, iss.issue_type,
-        iss.asset_id, iss.playlist_date, iss.playlist_start_time
-      );
     }
+
+    // Playlist versions come from the alerts themselves (works even when the playlist endpoint is 403),
+    // then flag alerts whose earlier playlist version was already ticketed
+    plVers += db.recordVersionsFromAlerts(issues);
+    for (const iss of issues) db.checkAndMarkPersistence(iss.id, iss.playlist_id);
 
     // Alerts skipped as unmonitored still exist in ATOM — don't resolution-check them
     for (const id of fetchedIds) seen.add(id);
-    // Resolution checks are skipped while any view failed (can't tell "left the view" from "not fetched")
+    // Resolution checks are skipped while any view failed (can't tell "left the view" from "not fetched");
+    // alerts in views of other lanes are checked when their lane syncs
     const incomplete = truncated || failedViewIds.length > 0;
-    const resolved = await detectResolved(seen, incomplete);
+    const resolved = await detectResolved(seen, incomplete, unfetchedViewIds);
 
     lastCounts = {
       issues: upserted, occurrences: occs, playlist_versions: plVers, resolved,
@@ -123,10 +151,16 @@ async function sync() {
       mode: mode || 'types', views: viewsMode ? atomApi.getViewList().filter(v => v.selected).length : 0,
       view_errors: viewErrors ? viewErrors.length : 0,
       catalog_feeds: db.countAtomFeeds(), catalog_errors: catalog.errors.length, truncated: incomplete,
+      lanes, views_fetched: fetchedViewIds.length,
     };
     lastSyncTime = new Date().toISOString(); lastSyncStatus = 'success';
+    // Type mode fetches everything, so every lane is fresh
+    for (const lane of viewsMode ? lanes : atomApi.LANES) {
+      lastLaneSync[lane] = lastSyncTime;
+      try { db.setMeta(laneMetaKey(lane), lastSyncTime); } catch {}
+    }
     try { db.setMeta('last_atom_sync', lastSyncTime); } catch {}
-    console.log(`[sync] Done (${viewsMode ? `views:${lastCounts.views}` : 'types'}) — issues:${upserted} skippedUnmonitored:${skippedUnmonitored} purged:${purged} occs:${occs} plVers:${plVers} resolved:${resolved} catalogFeeds:${lastCounts.catalog_feeds}${truncated ? ' (TRUNCATED)' : failedViewIds.length ? ` (${failedViewIds.length} view(s) failed)` : ''}`);
+    console.log(`[sync] Done (${viewsMode ? `views:${fetchedViewIds.length} [${lanes.join('+')}]` : 'types'}) — issues:${upserted} skippedUnmonitored:${skippedUnmonitored} purged:${purged} occs:${occs} plVers:${plVers} resolved:${resolved} catalogFeeds:${lastCounts.catalog_feeds}${truncated ? ' (TRUNCATED)' : failedViewIds.length ? ` (${failedViewIds.length} view(s) failed)` : ''}`);
   } catch (err) {
     lastSyncStatus='error'; lastSyncError=err.message;
     console.error('[sync] Failed:', err.message);
@@ -138,9 +172,9 @@ async function sync() {
  * (resolved, or moved out of the fetched states). Confirm each with GET /alerts/{id}.
  * Skipped when the fetch was truncated, so a partial sync never marks alerts resolved.
  */
-async function detectResolved(seen, truncated) {
+async function detectResolved(seen, truncated, skipViewIds = []) {
   if (!atomApi.isLive() || truncated) return 0;
-  const missing = db.getOpenAtomIssues().filter(id => !seen.has(id)).slice(0, RESOLVE_CHECK_LIMIT);
+  const missing = db.getOpenAtomIssues(skipViewIds).filter(id => !seen.has(id)).slice(0, RESOLVE_CHECK_LIMIT);
   let resolved = 0;
   const queue = [...missing];
   const worker = async () => { for (let id = queue.shift(); id !== undefined; id = queue.shift()) await checkOne(id); };
@@ -165,15 +199,31 @@ async function detectResolved(seen, truncated) {
   return resolved;
 }
 
+/** Lanes whose last successful sync is older than their interval (1 min slack for tick jitter). */
+function dueLanes(now = Date.now()) {
+  return atomApi.LANES.filter(lane => {
+    let last = Date.parse(lastLaneSync[lane]);
+    if (!Number.isFinite(last)) {
+      // Before per-lane tracking existed, fall back to the last full sync
+      try { last = Date.parse(db.getMeta(laneMetaKey(lane)) || db.getMeta('last_atom_sync')); } catch {}
+    }
+    return !Number.isFinite(last) || now - last >= (LANE_INTERVAL_MIN[lane] - 1) * 60e3;
+  });
+}
+
+function tick() {
+  const lanes = dueLanes();
+  if (lanes.length) return sync({ lanes });
+}
+
 function startSyncScheduler() {
-  // Don't sync on every restart (dev servers restart a lot): only if the last success is old enough
-  let last = null;
-  try { last = Date.parse(db.getMeta('last_atom_sync')); } catch {}
-  const due = !Number.isFinite(last) || Date.now() - last >= SYNC_INTERVAL_MIN * 60e3;
-  if (due) sync();
-  else console.log(`[sync] last sync ${Math.round((Date.now() - last) / 60e3)} min ago — next on schedule`);
-  cron.schedule(`*/${SYNC_INTERVAL_MIN} * * * *`, () => sync());
-  console.log(`[sync] Scheduler started (every ${SYNC_INTERVAL_MIN} min, ATOM cap ${atomApi.rateInfo().limit_per_min} req/min)`);
+  // Don't sync on every restart (dev servers restart a lot): only lanes that are actually due
+  const due = dueLanes();
+  if (due.length) sync({ lanes: due });
+  else console.log('[sync] all lanes synced recently — next on schedule');
+  cron.schedule(`*/${TICK_MIN} * * * *`, () => tick());
+  const every = Object.entries(LANE_INTERVAL_MIN).map(([l, m]) => `${l} ${m} min`).join(', ');
+  console.log(`[sync] Scheduler started (${every}; ATOM cap ${atomApi.rateInfo().limit_per_min} req/min)`);
 }
 
 module.exports = {
@@ -186,6 +236,9 @@ module.exports = {
     atom_auth: atomApi.authInfo(),
     atom_rate: atomApi.rateInfo(),
     interval_min: SYNC_INTERVAL_MIN,
+    lane_interval_min: LANE_INTERVAL_MIN,
+    lane_last_sync: Object.fromEntries(atomApi.LANES.map(l => [l, lastLaneSync[l] || null])),
   }),
-  triggerSync: () => sync(),
+  triggerSync: (opts) => sync(opts),
+  dueLanes,
 };

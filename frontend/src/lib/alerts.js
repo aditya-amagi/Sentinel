@@ -10,6 +10,8 @@ const TOC_LABELS = {
 };
 
 export const isToc = t => TOC_TYPES.includes(t);
+// TOC section membership: the backend tags is_toc (4 TOC types + alerts in ATOM "Asset" views).
+export const isTocIssue = i => (i?.is_toc != null ? Boolean(i.is_toc) : isToc(i?.issue_type));
 
 export function humanize(raw) {
   if (!raw) return '';

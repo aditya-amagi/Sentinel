@@ -42,7 +42,7 @@ Modes (`atomApi.js`):
 |---|---|---|
 | Live | `ATOM_BASE_URL` set, `DEMO_MODE` not `true` | Real ATOM calls |
 | Demo | `DEMO_MODE=true` | No ATOM calls; deterministic seed (`demoData.js`) incl. feed catalog, severities and 3 non-TOC alerts; playlist context is synthetic |
-| Mock | Neither set | **Realistic offline ATOM** (`atomMock.js`): prod-shaped alerts in the same saved views (EMEA / APAC / America / Enterprise Customer / Bein EMEA, Schedule / Asset / Live, Playout Rescue), a feed catalog with timezones and headends, deterministic per day, resolving over time. Goes through the real view → normalise → catalog path; makes **no network calls** |
+| Mock | Neither set | **Realistic offline ATOM** (`atomMock.js`): prod-shaped alerts in the same saved views (EMEA / APAC / America / Enterprise Customer / Bein EMEA, Schedule / Asset / Live, Service Alerts), a feed catalog with timezones and headends, deterministic per day, resolving over time. Goes through the real view → normalise → catalog path; makes **no network calls** |
 
 ---
 
@@ -54,14 +54,17 @@ All variables live in `backend/.env`, loaded at startup by the small loader at t
 |---|---|---|
 | `ATOM_BASE_URL` | empty (= mock) | API base **including** `/v1/api`. Prod `https://am.amagi.tv/v1/api` |
 | `ATOM_API_KEY` | — | Service key → `X-API-Key` header. Highest priority |
-| `ATOM_REFRESH_TOKEN` | — | SSO **refresh** token; Sentinel renews access tokens itself (§3) |
+| `ATOM_ALLOW_TOKEN_RENEWAL` | `false` | Allow automatic token renewal (refresh token / login). Off: only API key or a pasted access token |
+| `ATOM_REFRESH_TOKEN` | — | SSO **refresh** token; used only when renewal is allowed (§3) |
 | `ATOM_BEARER_TOKEN` | — | SSO **access** token (`eyJ…` JWT, ~24h). Also used as the first access token in refresh mode |
 | `ATOM_EMAIL` / `ATOM_PASSWORD` | — | Credentials login (`/auth/user/login`). Not available for Amagi SSO users |
 | `ATOM_SESSION_FILE` | `backend/.atom_session.json` | Where rotated refresh tokens are saved (Docker: `/app/data/.atom_session.json`) |
 | `ATOM_MAX_REQUESTS_PER_MIN` | `20` | **Hard cap** on ATOM requests started in any rolling minute, including token refresh |
 | `ATOM_MAX_CONCURRENCY` | `1` | ATOM requests in flight at once |
-| `ATOM_SYNC_INTERVAL_MIN` | `10` | Minutes between syncs (5–60). A restart doesn't sync if the last success is newer than this |
-| `ATOM_VIEWS` | `auto` | **Ingest by ATOM saved views** (§4.0). `auto` = region/customer views + Playout Rescue; `16,19,31` = these view ids; `off` = legacy type-based ingestion |
+| `ATOM_SYNC_ASSET_MIN` | `15` | Minutes between syncs of the `<Group> Asset` views (5–120) |
+| `ATOM_SYNC_SCHEDULE_MIN` | `30` | Minutes between syncs of the `<Group> Schedule` views (5–120) |
+| `ATOM_SYNC_OTHER_MIN` | `15` | Minutes between syncs of every other selected view: Live views, Service Alerts (5–120) |
+| `ATOM_VIEWS` | `auto` | **Ingest by ATOM saved views** (§4.0). `auto` = Schedule/Asset/Live views of the `ATOM_VIEW_GROUPS` groups + Service Alerts; `16,19,31` = these view ids; `off` = legacy type-based ingestion |
 | `ATOM_VIEW_TIMEOUT_MS` | `120000` | Per-request timeout for view queries (some views take ATOM > 60 s) |
 | `ATOM_ALERT_TYPES` | empty = built-in list (§4.2) | Type mode only. Comma-separated override; `*` or `all` = every type |
 | `ATOM_ALERT_STATES` | `active,snoozed` | States to pull (one request per state) |
@@ -82,15 +85,17 @@ All variables live in `backend/.env`, loaded at startup by the small loader at t
 On 2026-11-18 ATOM prod went down while Sentinel was sending about 4,000 requests in 2 hours, with bursts of many parallel requests. Every ATOM call now goes through `backend/atomGuard.js`:
 - **Rate cap.** At most `ATOM_MAX_REQUESTS_PER_MIN` (20) requests start in any rolling minute, with at most `ATOM_MAX_CONCURRENCY` (1) in flight. Token refresh and login count too.
 - **Circuit breaker.** After 3 consecutive timeouts, network errors or 5xx responses, or immediately on a 429 (honouring `Retry-After`), **all** ATOM calls stop for 2 min. The pause doubles on each repeat (4, 8, … up to 30 min). Syncs are skipped while paused. 4xx such as 401/403/404 don't count.
-- **No restart storms.** The last successful sync time is stored (`app_meta`). A restart only syncs if that is older than `ATOM_SYNC_INTERVAL_MIN`.
+- **No restart storms.** The last successful sync time is stored (`app_meta`). A restart only syncs the lanes whose last success is older than their interval. The scheduler ticks every 5 min and fetches only the due lanes (Asset + Schedule + other share one run when due together). A lane-only run never purges or resolution-checks alerts that sit in views of other lanes, and keeps their membership of those views.
 - **Visible.** `/api/sync/status → atom_rate` reports `limit_per_min`, `used_last_min`, `in_flight`, `total_requests`, `paused_until` and `pause_reason`. The sidebar shows "ATOM calls paused until …".
 
-Expected load in view mode with defaults: about 55–60 view pages, up to 25 resolution checks and up to 20 playlist lookups per sync (just 1 when playlists are 403'd), plus catalog lookups only when a catalog is over 24h old. A sync every 10 min gives **about 6–9k requests/day, never more than 20 in a minute** (hard ceiling 28,800/day). A 15 min interval brings that to about 4–6k/day.
+Expected load in view mode with defaults: about 55–60 view pages, up to 25 resolution checks and up to 20 playlist lookups per sync (just 1 when playlists are 403'd), plus catalog lookups only when a catalog is over 24h old. With per-lane intervals (Asset and other views every 15 min, Schedule views every 30 min) that is roughly **3–5k requests/day, never more than 20 in a minute** (hard ceiling 28,800/day).
 
 ## 3. Authentication
 
 ### 3.1 Priority
-`ATOM_API_KEY` → `ATOM_REFRESH_TOKEN` → `ATOM_BEARER_TOKEN` → `ATOM_EMAIL`+`ATOM_PASSWORD`. If none is set while live, every sync fails with *"ATOM_BASE_URL is set but no credentials…"*.
+**Automatic token acquisition is OFF by default** (`ATOM_ALLOW_TOKEN_RENEWAL=false`). Sentinel only uses `ATOM_API_KEY` or a manually pasted `ATOM_BEARER_TOKEN`, which is never renewed. It never calls `/auth/sso/refresh` or `/auth/user/login` by itself. If only a refresh token or login is configured, every sync fails with a clear message and **no request is sent**.
+
+With `ATOM_ALLOW_TOKEN_RENEWAL=true` the priority is `ATOM_API_KEY` → `ATOM_REFRESH_TOKEN` → `ATOM_BEARER_TOKEN` → `ATOM_EMAIL`+`ATOM_PASSWORD`. If none is set while live, every sync fails with *"ATOM_BASE_URL is set but no credentials…"*.
 
 | Mode | Header | Renewal | Notes |
 |---|---|---|---|
@@ -121,8 +126,9 @@ ATOM prod is SSO-only (org `amagi`). Email/password login does not work for Amag
 ATOM views (`GET /me/views`) carry each team's scope **and its ignore rules**, e.g. "ignore schedule alerts for feeds X", "playout after 12h", "hole under 2000 ms". Sentinel therefore pulls **the alerts present in the selected views**, so TOC sees what the views show.
 
 - **Selection (`ATOM_VIEWS=auto`):**
-    - Included: views named `<Group> Schedule|Asset|Live [Alerts]` whose group doesn't start with "All", e.g. EMEA, APAC, America, Enterprise Customer, AN1–AN3, Cloudport Now, Bein EMEA. Also `Playout Rescue`.
-    - Excluded: catch-alls (`All CP …`, `All AN3 Alerts`) and everything else (Service Alerts, TS, AdOps, Player Crash, MCR Supervisors, PBSD, `Live alerts`).
+    - Included: `<Group> Schedule|Asset|Live [Alerts]` views of the monitored groups — `ATOM_VIEW_GROUPS`, default **AN1, AN2, AN3, Cloudport Now, America, Enterprise Customer, EMEA, APAC** — plus `Service Alerts`. Other groups (Bein EMEA, Hearst Network, NBCU UK, WBD, …) and `Playout Rescue` are not ingested.
+    - TOC section: the 4 TOC types plus every alert in an `<Group> Asset` view (e.g. Asset Download Waiting, Asset QC Failed); everything else is "Other ATOM alerts".
+    - Excluded: catch-alls (`All CP …`, `All AN3 Alerts`) and everything else (Playout Rescue, TS, AdOps, Player Crash, MCR Supervisors, PBSD, `Live alerts`).
     - Explicit ids override this.
 - **Query:** `GET /alerts?view_id=<id>&state=<active|snoozed>&sort_by=issue_start_time&sort_order=desc&limit&offset`.
     - ATOM rejects every other filter with `view_id` (only state, sort, group_by, issue_start_time, end_time, limit and offset are allowed). It accepts `issue_start_time` but **ignores** it.

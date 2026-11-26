@@ -17,11 +17,12 @@ Configuration lives in `backend/.env`. The backend loads it at startup, and real
 | `DEMO_MODE` | Seeds fixed deterministic dataset on startup and halts ATOM polling | No | `false` (Set `true` for demo/testing) |
 | `ATOM_BASE_URL` | ATOM API base incl. `/v1/api` — prod `https://am.amagi.tv/v1/api`, staging `https://am-staging.amagi.tv/v1/api` (Amagi users sign in via SSO; get a Bearer token from the web app or request an API key) | No | If empty, runs random mock generator |
 | `ATOM_API_KEY` | ATOM API key, sent as `X-API-Key` | One auth option | — |
+| `ATOM_ALLOW_TOKEN_RENEWAL` | Allow automatic token renewal (refresh token / login); off = API key or pasted access token only | No | `false` |
 | `ATOM_REFRESH_TOKEN` | SSO **refresh** token; Sentinel renews access tokens and saves each rotated token to `ATOM_SESSION_FILE` | One auth option | — |
 | `ATOM_BEARER_TOKEN` | SSO **access** token (`eyJ…`, ~24h), sent as `Authorization: Bearer` | One auth option | — |
 | `ATOM_SESSION_FILE` | Rotated refresh-token store (secret, git-ignored) | No | `backend/.atom_session.json` · Docker `/app/data/.atom_session.json` |
 | `ATOM_EMAIL` / `ATOM_PASSWORD` | ATOM user login; token fetched from `/auth/user/login` and renewed | One auth option | — |
-| `ATOM_VIEWS` | Ingest by ATOM saved views: `auto` (region/customer views + Playout Rescue), view ids, or `off` (type mode) | No | `auto` |
+| `ATOM_VIEWS` | Ingest by ATOM saved views: `auto` (region/customer views + Service Alerts), view ids, or `off` (type mode) | No | `auto` |
 | `ATOM_ALERT_TYPES` | ATOM types to pull. Empty = built-in list (4 TOC types + fault types; excludes `asset_download_waiting`/`asset_submitted`/`asset_queued`). `*` = all | No | empty |
 | `ATOM_ALERT_STATES` | ATOM states to pull (queried one at a time — prod has no `states` filter) | No | `active,snoozed` |
 | `ATOM_LOOKBACK_HOURS` | Only alerts with `issue_start_time` ≥ now − N hours (upcoming always included). `0` = no window | No | `72` |

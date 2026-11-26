@@ -173,4 +173,15 @@ describe('ATOM sync → Sentinel', () => {
     assert.ok(p.description.includes('Fill the gap'), 'hole-specific action');
     assert.ok(!p.description.includes('Technical details'), 'customer tickets carry no internal section');
   });
+
+  it('a ticket also covers every open alert in the same ATOM bucket (correlation_id)', () => {
+    const base = { raw_type: 'asset_missing_in_cloud', issue_type: 'MISSING_IN_CLOUD', feed_code: 'BKT1', correlation_id: 'bucket-xyz' };
+    db.upsertIssue({ ...base, atom_issue_id: 'B-1', playlist_id: '9001', playlist_date: '2026-11-20' });
+    db.upsertIssue({ ...base, atom_issue_id: 'B-2', playlist_id: '9001', playlist_date: '2026-11-20' });
+    db.upsertIssue({ ...base, atom_issue_id: 'B-3', playlist_id: '9001', playlist_date: null });          // same bucket, no date
+    db.upsertIssue({ ...base, atom_issue_id: 'X-1', playlist_id: '9002', playlist_date: '2026-11-21', correlation_id: 'other' });
+    const issue = db.getIssueByCompositeKey('B-1', '9001').issue;
+    const ids = db.buildFreshdeskPayload(issue, 'customer')._meta.covers.map(c => c.atom_issue_id).sort();
+    assert.deepEqual(ids, ['B-1', 'B-2', 'B-3']);
+  });
 });

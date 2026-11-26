@@ -3,7 +3,7 @@ import TicketModal from './TicketModal';
 import AckButton from './AckButton';
 import { SeverityPill, AtomStatePill, TriagePill, TypeLabel } from './Pills';
 import { api, issuePath } from '../lib/api';
-import { triageOf, fmtLong, fmtShort, fmtClock, fmtInZone, fmtDuration, relTime, isToc } from '../lib/alerts';
+import { triageOf, fmtLong, fmtShort, fmtClock, fmtInZone, fmtDuration, relTime, isTocIssue } from '../lib/alerts';
 import './IssueDetail.css';
 
 const TABS = [['overview', 'Overview'], ['playlist', 'Playlist'], ['activity', 'Activity'], ['tickets', 'Tickets']];
@@ -53,7 +53,8 @@ export default function IssueDetail({ atomIssueId, playlistId, onClose, onUpdate
     <div className="dp"><div className="dp-head"><span>Alert not found</span><CloseBtn onClick={onClose} /></div></div>
   );
 
-  const { issue, occurrences = [], playlistTimeline = [], previousTicketDetail } = data;
+  const { issue, occurrences = [], playlistTimeline = [], previousTicketDetail, versions = [] } = data;
+  const prevVersions = versions.filter(v => v.relation === 'previous');
   const state = triageOf(issue);
   const parentTicket = fdTickets.find(t => t.ticket_type !== 'followup' && t.freshdesk_id) || null;
 
@@ -62,11 +63,11 @@ export default function IssueDetail({ atomIssueId, playlistId, onClose, onUpdate
       <div className="dp-head">
         <div className="dp-head-main">
           <div className="dp-eyebrow">
-            <span className={`dp-kind ${isToc(issue.issue_type) ? 'toc' : 'other'}`}>{isToc(issue.issue_type) ? 'TOC alert' : 'ATOM alert'}</span>
+            <span className={`dp-kind ${isTocIssue(issue) ? 'toc' : 'other'}`}>{isTocIssue(issue) ? 'TOC alert' : 'ATOM alert'}</span>
             <span className="mono">{issue.feed_code}</span>
             {issue.region && <span>· {issue.region}</span>}
           </div>
-          <h2 className="dp-title"><TypeLabel type={issue.issue_type} rawType={issue.raw_type} /></h2>
+          <h2 className="dp-title"><TypeLabel type={issue.issue_type} rawType={issue.raw_type} toc={issue.is_toc != null ? Boolean(issue.is_toc) : undefined} /></h2>
           <div className="dp-pills">
             <TriagePill state={state} />
             <SeverityPill severity={issue.severity} />
@@ -83,6 +84,12 @@ export default function IssueDetail({ atomIssueId, playlistId, onClose, onUpdate
           {previousTicketDetail?.ticket_link && <a href={previousTicketDetail.ticket_link} target="_blank" rel="noopener noreferrer"> View ↗</a>}
         </div>
       ) : null}
+      {!issue.has_previous_ticket_same_day && prevVersions.length > 0 && (
+        <div className="dp-banner info">
+          <strong>Also in the previous playlist version.</strong> Playlist #{prevVersions[0].playlist_id} had the same problem
+          {` (${prevVersions[0].consolidated_status === 'resolved' ? 'resolved' : TRIAGE_WORD[prevVersions[0].state || 'penalty']}, not ticketed)`}. Check before raising a new ticket.
+        </div>
+      )}
       {issue.atom_writeback_error && !notice && (
         <div className="dp-banner err"><strong>Last ATOM update failed.</strong> {issue.atom_writeback_error}</div>
       )}
@@ -98,7 +105,7 @@ export default function IssueDetail({ atomIssueId, playlistId, onClose, onUpdate
 
       <div className="dp-body">
         {tab === 'overview' && <Overview issue={issue} feed={feed} occurrences={occurrences} />}
-        {tab === 'playlist' && <PlaylistTab issue={issue} timeline={playlistTimeline} occurrences={occurrences} feed={feed} />}
+        {tab === 'playlist' && <PlaylistTab issue={issue} timeline={playlistTimeline} versions={versions} feed={feed} />}
         {tab === 'activity' && <ActivityTab issue={issue} occurrences={occurrences} />}
         {tab === 'tickets'  && <TicketsTab tickets={fdTickets} onCreate={() => setModal('create')} onFollowup={() => setModal('followup')} />}
       </div>
@@ -224,7 +231,9 @@ function KV({ k, v, mono }) {
 
 // ── Playlist ────────────────────────────────────────────────────────────────
 
-function PlaylistTab({ issue, timeline, occurrences, feed }) {
+const TRIAGE_WORD = { penalty: 'Penalty', ack: 'Acknowledged', ticketed: 'Ticketed' };
+
+function PlaylistTab({ issue, timeline, versions, feed }) {
   const [ctx, setCtx] = useState(null);
   const [err, setErr] = useState('');
   useEffect(() => {
@@ -267,27 +276,33 @@ function PlaylistTab({ issue, timeline, occurrences, feed }) {
       </section>
 
       <section className="dp-section">
-        <h3>Published versions <span className="kv-sub">{issue.playlist_date}</span></h3>
+        <h3>Playlist versions <span className="kv-sub">{issue.feed_code} · {issue.playlist_date}</span></h3>
         {timeline.length === 0
-          ? <div className="muted-line">No playlist versions recorded yet.</div>
+          ? <div className="muted-line">No playlist id on this alert, so versions can't be tracked.</div>
           : <ol className="versions">
               {timeline.map((v, i) => {
-                const next = timeline[i + 1];
-                const s = new Date(v.published_at).getTime(), e = next ? new Date(next.published_at).getTime() : Infinity;
-                const hits = occurrences.filter(o => { const t = new Date(o.playout_start_time).getTime(); return t >= s && t < e; }).length;
                 const current = v.playlist_id === issue.playlist_id;
+                const match = versions.find(m => m.playlist_id === v.playlist_id);
                 return (
-                  <li key={v.id || i} className={current ? 'current' : ''}>
+                  <li key={v.id || v.playlist_id} className={current ? 'current' : match ? 'hit' : ''}>
                     <span className="v-dot" />
-                    <span className="mono v-time">{fmtClock(v.published_at)}</span>
                     <span className="mono">#{v.playlist_id}</span>
-                    <span className="v-tag">{i === 0 ? 'initial' : 'republished'}</span>
+                    <span className="v-time mono" title="First seen on an ATOM alert">{fmtShort(v.published_at)}</span>
+                    <span className="v-tag">{i === 0 ? 'first seen' : 'republished'}</span>
                     {current && <span className="v-tag cur">this alert</span>}
-                    {hits > 0 && <span className="v-hits">{hits} occurrence{hits > 1 ? 's' : ''}</span>}
+                    {!current && match && (
+                      <span className={`v-tag ${match.ticket_id ? 'tk' : 'hitt'}`}>
+                        same problem · {match.ticket_id ? `ticket ${match.ticket_id}` : match.consolidated_status === 'resolved' ? 'resolved' : TRIAGE_WORD[match.state || 'penalty']}
+                      </span>
+                    )}
+                    {!current && !match && <span className="v-none">not present</span>}
                   </li>
                 );
               })}
             </ol>}
+        <div className="muted-line" style={{ marginTop: 8, fontSize: 12 }}>
+          Versions come from the playlist ids on ATOM alerts for this feed and day. A republish raises a new alert with the new id.
+        </div>
       </section>
     </>
   );

@@ -55,7 +55,8 @@ async function syncCatalog(urls) {
   const candidates = urls
     ? [...new Set(urls.filter(Boolean))].filter(u => !db.automationSyncedWithin(u, REFRESH_HOURS))
     : db.getStaleAutomationUrls(REFRESH_HOURS);
-  const queue = candidates.slice(0, MAX_PER_RUN);
+  // Mock mode reads a local file — no ATOM to protect, so load everything at once
+  const queue = atomApi.isMock() ? candidates.slice() : candidates.slice(0, MAX_PER_RUN);
   const worker = async () => {
     for (let url = queue.shift(); url !== undefined; url = queue.shift()) {
       try {

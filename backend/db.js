@@ -194,10 +194,12 @@ function upsertIssue(issue) {
 }
 
 /** Open (active/snoozed) ATOM issues in the DB — candidates for resolution detection. */
-function getOpenAtomIssues() {
+/** Open ATOM alert ids, oldest first. Alerts in any of `skipViewIds` (views not fetched this run) are left out. */
+function getOpenAtomIssues(skipViewIds = []) {
+  const skip = skipViewIds.map(id => ` AND COALESCE(atom_view_ids,'') NOT LIKE '%,${Number(id)},%'`).join('');
   return getDb().prepare(`
     SELECT atom_issue_id FROM issues
-    WHERE consolidated_status IN ('active','snoozed') OR consolidated_status IS NULL
+    WHERE (consolidated_status IN ('active','snoozed') OR consolidated_status IS NULL)${skip}
     GROUP BY atom_issue_id
     ORDER BY MIN(updated_at) ASC, MIN(id) ASC
   `).all().map(r => r.atom_issue_id);
@@ -280,46 +282,92 @@ function insertOccurrenceIfNotExists(occ) {
 
 // ── Same-day ticket check ────────────────────────────────────────────────────
 
-/**
- * Returns prior ticket if same feed + issue_type + asset + same calendar day
- * and a DIFFERENT playlist already has a ticket.
- */
-function findSameDayPreviousTicket({ feed_code, issue_type, asset_id, playlist_id, playlist_date }) {
-  return getDb().prepare(`
-    SELECT t.*, i.playlist_start_time as prev_playlist_time, i.playlist_id as prev_playlist_id
-    FROM tickets t
-    JOIN issues i ON i.atom_issue_id = t.atom_issue_id AND i.playlist_id = t.playlist_id
-    WHERE t.feed_code  = ?
-      AND t.issue_type = ?
-      AND (t.asset_id IS NULL OR t.asset_id = ? OR ? IS NULL)
-      AND t.playlist_id != ?
-      AND DATE(i.playlist_start_time) = DATE(?)
-    ORDER BY t.created_at DESC
-    LIMIT 1
-  `).get(feed_code, issue_type, asset_id || null, asset_id || null, playlist_id, playlist_date || new Date().toISOString());
+// ── Playlist versions (derived from alerts) ──────────────────────────────────
+// ATOM alerts carry the published playlist's id (entity.custom.playlist_id == blip_playlist_id).
+// playlist_id is part of the alert's entity — its identity — so when a playlist is republished, an
+// alert that is still valid comes back as a NEW alert with the new playlist id. Each distinct id seen
+// for a feed + broadcast date is therefore a published version; a lower id is an earlier version.
+
+const realPid = p => /^\d+$/.test(String(p ?? '')) && String(p) !== '0';
+
+/** Record playlist versions from fetched alerts (works without the playlist endpoint). */
+function recordVersionsFromAlerts(issues) {
+  const firstSeen = new Map();
+  for (const i of issues) {
+    if (!i.feed_code || !i.playlist_date || !realPid(i.playlist_id)) continue;
+    const key = `${i.feed_code}|${i.playlist_date}|${i.playlist_id}`;
+    const t = i.created_at || i.earliest_scheduled || new Date().toISOString();
+    const cur = firstSeen.get(key);
+    if (!cur || String(t) < String(cur.published_at)) {
+      firstSeen.set(key, { feed_code: i.feed_code, playlist_date: i.playlist_date, playlist_id: String(i.playlist_id), published_at: t, region: i.region || null });
+    }
+  }
+  let added = 0;
+  for (const v of firstSeen.values()) if (insertPlaylistVersionIfNew(v)) added++;
+  return added;
 }
 
 /**
- * Called during sync to stamp has_previous_ticket_same_day on the issue.
+ * The same problem in OTHER playlist versions of the same feed + broadcast day:
+ * same type, and the same asset (asset alerts) or the same start time ±5 min (holes etc.).
+ * Each match is tagged relation 'previous' (lower playlist id) or 'later'.
  */
-function checkAndMarkPersistence(atom_issue_id, playlist_id, feed_code, issue_type, asset_id, playlist_date, playlist_start_time) {
-  const prev = findSameDayPreviousTicket({ feed_code, issue_type, asset_id, playlist_id, playlist_date: playlist_start_time || playlist_date });
-  if (prev) {
-    getDb().prepare(`
-      UPDATE issues SET
-        has_previous_ticket_same_day = 1,
-        previous_ticket_id   = ?,
-        previous_playlist_id = ?,
-        previous_playlist_time = ?,
-        updated_at = CURRENT_TIMESTAMP
-      WHERE atom_issue_id=? AND playlist_id=? AND has_previous_ticket_same_day=0
-    `).run(
-      prev.ticket_number || String(prev.id),
-      prev.prev_playlist_id,
-      prev.prev_playlist_time,
-      atom_issue_id, playlist_id
-    );
-  }
+function findAcrossVersions(issue) {
+  if (!issue?.feed_code || !issue.playlist_date || !issue.issue_type || !realPid(issue.playlist_id)) return [];
+  const rows = getDb().prepare(`
+    SELECT atom_issue_id, playlist_id, state, consolidated_status, ticket_id, ticket_link, ticket_url,
+           asset_id, earliest_scheduled, playlist_start_time, created_at, severity
+    FROM issues
+    WHERE feed_code = ? AND playlist_date = ? AND issue_type = ?
+      AND playlist_id != ? AND playlist_id != '' AND playlist_id != '0'
+  `).all(issue.feed_code, issue.playlist_date, issue.issue_type, String(issue.playlist_id));
+  const t0 = Date.parse(issue.earliest_scheduled || issue.playlist_start_time);
+  const pid = Number(issue.playlist_id);
+  return rows.filter(r => {
+    if (!realPid(r.playlist_id)) return false;
+    if (issue.asset_id || r.asset_id) return Boolean(issue.asset_id) && r.asset_id === issue.asset_id;
+    const t1 = Date.parse(r.earliest_scheduled || r.playlist_start_time);
+    if (Number.isFinite(t0) && Number.isFinite(t1)) return Math.abs(t0 - t1) <= 5 * 60e3;
+    return true;   // e.g. no_published_playlist: one per feed and day
+  }).map(r => ({ ...r, relation: Number(r.playlist_id) < pid ? 'previous' : 'later' }))
+    .sort((a, b) => Number(b.playlist_id) - Number(a.playlist_id));
+}
+
+function versionPublishedAt(feed_code, playlist_date, playlist_id) {
+  const r = getDb().prepare(`SELECT published_at FROM playlist_timeline WHERE feed_code=? AND playlist_date=? AND playlist_id=?`)
+    .get(feed_code, playlist_date, String(playlist_id));
+  return r ? r.published_at : null;
+}
+
+/** Previous playlist version of the same problem that already has a ticket (or null). */
+function findSameDayPreviousTicket({ feed_code, issue_type, asset_id, playlist_id, playlist_date, earliest_scheduled }) {
+  const prev = findAcrossVersions({ feed_code, issue_type, asset_id, playlist_id, playlist_date, earliest_scheduled })
+    .find(m => m.relation === 'previous' && m.ticket_id);
+  if (!prev) return null;
+  return { ...prev, ticket_number: prev.ticket_id, prev_playlist_id: prev.playlist_id,
+    prev_playlist_time: versionPublishedAt(feed_code, playlist_date, prev.playlist_id) || prev.created_at };
+}
+
+/** Flag an issue when an earlier playlist version of the same problem was already ticketed. */
+function checkAndMarkPersistence(atom_issue_id, playlist_id) {
+  const issue = getDb().prepare(`SELECT * FROM issues WHERE atom_issue_id=? AND playlist_id=?`).get(atom_issue_id, playlist_id);
+  if (!issue) return;
+  const prev = findSameDayPreviousTicket(issue);
+  if (!prev) return;
+  getDb().prepare(`
+    UPDATE issues SET has_previous_ticket_same_day = 1, previous_ticket_id = ?, previous_playlist_id = ?,
+      previous_playlist_time = ?, updated_at = CURRENT_TIMESTAMP
+    WHERE atom_issue_id=? AND playlist_id=? AND has_previous_ticket_same_day=0
+  `).run(prev.ticket_number, prev.prev_playlist_id, prev.prev_playlist_time, atom_issue_id, playlist_id);
+}
+
+/** After a ticket is created, flag the same problem in LATER playlist versions. */
+function markLaterVersions(atom_issue_id, playlist_id) {
+  const issue = getDb().prepare(`SELECT * FROM issues WHERE atom_issue_id=? AND playlist_id=?`).get(atom_issue_id, playlist_id);
+  if (!issue) return 0;
+  const later = findAcrossVersions(issue).filter(m => m.relation === 'later');
+  for (const m of later) checkAndMarkPersistence(m.atom_issue_id, m.playlist_id);
+  return later.length;
 }
 
 // ── Ticket creation ──────────────────────────────────────────────────────────
@@ -337,20 +385,8 @@ function createTicket({ atom_issue_id, playlist_id, feed_code, issue_type, asset
     WHERE atom_issue_id=? AND playlist_id=?
   `).run(ticket_number || null, ticket_link || null, atom_issue_id, playlist_id);
 
-  // Re-check persistence on any same-day playlists that don't have warning yet
-  if (feed_code && issue_type) {
-    const sameDayIssues = db.prepare(`
-      SELECT i.atom_issue_id, i.playlist_id, i.asset_id, i.playlist_date, i.playlist_start_time
-      FROM issues i
-      WHERE i.feed_code=? AND i.issue_type=?
-        AND DATE(i.playlist_start_time) = DATE(?)
-        AND i.playlist_id != ?
-        AND i.has_previous_ticket_same_day = 0
-    `).all(feed_code, issue_type, new Date().toISOString(), playlist_id);
-    for (const row of sameDayIssues) {
-      checkAndMarkPersistence(row.atom_issue_id, row.playlist_id, feed_code, issue_type, row.asset_id, row.playlist_date, row.playlist_start_time);
-    }
-  }
+  // Flag the same problem in later playlist versions of the day
+  markLaterVersions(atom_issue_id, playlist_id);
 
   return db.prepare(`SELECT * FROM tickets WHERE id=?`).get(result.lastInsertRowid);
 }
@@ -382,7 +418,7 @@ function getPlaylistTimeline(feed_code, playlist_date) {
   return getDb().prepare(`
     SELECT * FROM playlist_timeline
     WHERE feed_code = ? AND playlist_date = ?
-    ORDER BY playlist_id ASC
+    ORDER BY CAST(playlist_id AS INTEGER) ASC
   `).all(feed_code, playlist_date);
 }
 
@@ -405,7 +441,7 @@ function getUpcomingIssues(filters = {}) {
   q += ` GROUP BY i.atom_issue_id, i.playlist_id ORDER BY `
      + (filters.sort === 'severity' ? `${SEVERITY_RANK_SQL}, ` : '')
      + `i.playlist_start_time ASC NULLS LAST, i.earliest_scheduled ASC NULLS LAST, i.updated_at DESC`;
-  return db.prepare(q).all(...params);
+  return markToc(db.prepare(q).all(...params));
 }
 
 // ── History ──────────────────────────────────────────────────────────────────
@@ -466,18 +502,18 @@ function getIssueByCompositeKey(atom_issue_id, playlist_id) {
   const playlistTimeline = (issue.feed_code && issue.playlist_date)
     ? getPlaylistTimeline(issue.feed_code, issue.playlist_date) : [];
 
-  // Previous ticket detail
+  // Previous ticket detail (the ticketed issue in the earlier playlist version)
   let previousTicketDetail = null;
   if (issue.previous_ticket_id && issue.previous_playlist_id) {
     previousTicketDetail = db.prepare(`
-      SELECT t.*, i.playlist_date, i.playlist_start_time
-      FROM tickets t
-      JOIN issues i ON i.atom_issue_id=t.atom_issue_id AND i.playlist_id=t.playlist_id
-      WHERE t.playlist_id=? AND t.feed_code=? LIMIT 1
-    `).get(issue.previous_playlist_id, issue.feed_code);
+      SELECT ticket_id AS ticket_number, COALESCE(ticket_url, ticket_link) AS ticket_link, playlist_id, playlist_date
+      FROM issues WHERE feed_code=? AND playlist_id=? AND ticket_id=? LIMIT 1
+    `).get(issue.feed_code, issue.previous_playlist_id, issue.previous_ticket_id) || null;
   }
 
-  return { issue, occurrences, playlistTimeline, previousTicketDetail };
+  const versions = findAcrossVersions(issue);   // same problem in other playlist versions of the day
+  markToc(issue);
+  return { issue, occurrences, playlistTimeline, previousTicketDetail, versions };
 }
 
 function getIssueById(id) {
@@ -502,7 +538,34 @@ function getIssues(filters = {}) {
   const params = [];
   applyFilters(filters, q, params, (c, v) => { q += c; params.push(...v); });
   q += ` GROUP BY i.atom_issue_id, i.playlist_id ORDER BY i.updated_at DESC`;
-  return db.prepare(q).all(...params);
+  return markToc(db.prepare(q).all(...params));
+}
+
+// ── TOC scope ────────────────────────────────────────────────────────────────
+// TOC = the 4 canonical types, plus every alert in an ATOM "Asset" view (e.g. "EMEA Asset Alerts"):
+// TOC monitors those asset issues too. Everything else is "Other ATOM alerts".
+function assetViewIds() {
+  return getDb().prepare(`SELECT id FROM atom_views WHERE family = 'Asset' COLLATE NOCASE`).all().map(r => r.id);
+}
+
+/** SQL condition (never NULL) + params that is true for TOC alerts. `col` prefixes column names. */
+function tocCondition(col = 'i.') {
+  const parts = [`COALESCE(${col}issue_type IN (${AT.ALERT_KEYS.map(() => '?').join(',')}), 0)`];
+  const params = [...AT.ALERT_KEYS];
+  for (const id of assetViewIds()) { parts.push(`COALESCE(${col}atom_view_ids LIKE ?, 0)`); params.push(`%,${id},%`); }
+  return { sql: `(${parts.join(' OR ')})`, params };
+}
+
+/** Tag rows with is_toc (1/0) so the UI splits sections by the same rule as the filters/KPIs. */
+function markToc(rows) {
+  const ids = assetViewIds();
+  const one = r => {
+    if (!r) return r;
+    const views = String(r.atom_view_ids || '');
+    r.is_toc = AT.ALERT_KEYS.includes(r.issue_type) || ids.some(id => views.includes(`,${id},`)) ? 1 : 0;
+    return r;
+  };
+  return Array.isArray(rows) ? rows.map(one) : one(rows);
 }
 
 function applyFilters(filters, _q, _p, push) {
@@ -530,9 +593,11 @@ function applyFilters(filters, _q, _p, push) {
     push(` AND (i.consolidated_status IS NULL OR i.consolidated_status NOT IN ('resolved'))`, []);
   else if (['active','snoozed','resolved'].includes(filters.atom_state))
     push(` AND i.consolidated_status=?`, [filters.atom_state]);
-  // TOC split: the 4 canonical types vs every other ATOM type
-  if (filters.toc_only === 'true')  push(` AND i.issue_type IN (${AT.ALERT_KEYS.map(() => '?').join(',')})`, AT.ALERT_KEYS);
-  if (filters.toc_only === 'false') push(` AND (i.issue_type IS NULL OR i.issue_type NOT IN (${AT.ALERT_KEYS.map(() => '?').join(',')}))`, AT.ALERT_KEYS);
+  // TOC split: the 4 canonical types + Asset-view alerts vs every other ATOM alert
+  if (filters.toc_only === 'true' || filters.toc_only === 'false') {
+    const t = tocCondition('i.');
+    push(filters.toc_only === 'true' ? ` AND ${t.sql}` : ` AND NOT ${t.sql}`, t.params);
+  }
 }
 
 // Severity rank for ORDER BY (blocker first)
@@ -574,6 +639,7 @@ function getStats(region) {
   const db = getDb();
   const w  = region ? `AND region='${region.replace(/'/g,"''")}' COLLATE NOCASE` : '';
   const now = new Date().toISOString();
+  const toc = tocCondition('');
   return {
     total:     db.prepare(`SELECT COUNT(*) as c FROM issues WHERE 1=1 ${w}`).get().c,
     upcoming:  db.prepare(`SELECT COUNT(*) as c FROM issues WHERE (playlist_start_time>=? OR playlist_start_time IS NULL) ${w}`).get(now).c,
@@ -587,8 +653,8 @@ function getStats(region) {
     atom_active:   db.prepare(`SELECT COUNT(*) as c FROM issues WHERE consolidated_status='active' ${w}`).get().c,
     atom_snoozed:  db.prepare(`SELECT COUNT(*) as c FROM issues WHERE consolidated_status='snoozed' ${w}`).get().c,
     atom_resolved: db.prepare(`SELECT COUNT(*) as c FROM issues WHERE consolidated_status='resolved' ${w}`).get().c,
-    toc_open:      db.prepare(`SELECT COUNT(*) as c FROM issues WHERE issue_type IN (${AT.ALERT_KEYS.map(k => `'${k}'`).join(',')}) AND (consolidated_status IS NULL OR consolidated_status!='resolved') ${w}`).get().c,
-    other_open:    db.prepare(`SELECT COUNT(*) as c FROM issues WHERE (issue_type IS NULL OR issue_type NOT IN (${AT.ALERT_KEYS.map(k => `'${k}'`).join(',')})) AND (consolidated_status IS NULL OR consolidated_status!='resolved') ${w}`).get().c,
+    toc_open:      db.prepare(`SELECT COUNT(*) as c FROM issues WHERE ${toc.sql} AND (consolidated_status IS NULL OR consolidated_status!='resolved') ${w}`).get(...toc.params).c,
+    other_open:    db.prepare(`SELECT COUNT(*) as c FROM issues WHERE NOT ${toc.sql} AND (consolidated_status IS NULL OR consolidated_status!='resolved') ${w}`).get(...toc.params).c,
     by_severity:   Object.fromEntries(db.prepare(`SELECT COALESCE(severity,'unknown') s, COUNT(*) c FROM issues WHERE (consolidated_status IS NULL OR consolidated_status!='resolved') ${w} GROUP BY s`).all().map(r => [r.s, r.c])),
     writeback_errors: db.prepare(`SELECT COUNT(*) as c FROM issues WHERE atom_writeback_error IS NOT NULL ${w}`).get().c,
   };
@@ -601,7 +667,8 @@ module.exports = {
   getUpcomingIssues, getHistoryFeeds, getHistoryPlaylists, getHistoryIssues,
   getIssueById, getIssueByCompositeKey, getIssues, updateIssue,
   getDistinctIssueTypes, getDistinctRegions, getStats,
-  getOpenAtomIssues, updateAtomLifecycle, getOtherIssueTypes,
+  getOpenAtomIssues, updateAtomLifecycle, getOtherIssueTypes, tocCondition, markToc,
+  recordVersionsFromAlerts, findAcrossVersions, markLaterVersions,
 };
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -820,19 +887,24 @@ function priorityForSeverity(sev) { return SEVERITY_PRIORITY[sev] || 2; }
 
 /**
  * Other open alerts of the same type on the same feed and broadcast day that are not yet
- * ticketed — one ticket covers them all (e.g. several hole timings on one playlist).
+ * ticketed — one ticket covers them all (e.g. several hole timings on one playlist) — plus every
+ * open alert in the same ATOM bucket (correlation_id).
  */
 function getRelatedOpenAlerts(issue) {
-  if (!issue?.atom_issue_id || !issue.feed_code || !issue.issue_type || !issue.playlist_date) return [];
+  if (!issue?.atom_issue_id) return [];
+  const sameDay = Boolean(issue.feed_code && issue.issue_type && issue.playlist_date);
+  const bucket  = issue.correlation_id || null;   // ATOM bucket: always covered as a whole
+  if (!sameDay && !bucket) return [];
   return getDb().prepare(`
     SELECT * FROM issues
-    WHERE feed_code = ? AND issue_type = ? AND playlist_date = ?
+    WHERE ((? AND feed_code = ? AND issue_type = ? AND playlist_date = ?) OR (? IS NOT NULL AND correlation_id = ?))
       AND NOT (atom_issue_id = ? AND playlist_id = ?)
       AND (consolidated_status IS NULL OR consolidated_status != 'resolved')
       AND COALESCE(state, 'penalty') != 'ticketed'
     ORDER BY COALESCE(earliest_scheduled, playlist_start_time) ASC
     LIMIT 50
-  `).all(issue.feed_code, issue.issue_type, issue.playlist_date, issue.atom_issue_id, issue.playlist_id);
+  `).all(sameDay ? 1 : 0, issue.feed_code ?? null, issue.issue_type ?? null, issue.playlist_date ?? null,
+    bucket, bucket, issue.atom_issue_id, issue.playlist_id);
 }
 
 function buildFreshdeskPayload(issue, ticket_type, { now } = {}) {
@@ -1004,6 +1076,46 @@ function getViewSummary() {
  * are in no selected view any more — resolved, or now matched by a view's ignore rule.
  * Triaged/ticketed rows stay; resolution detection updates them.
  */
+const parseViewIds = s => String(s || '').split(',').filter(Boolean).map(Number).filter(Number.isFinite);
+
+/** atom_issue_id → [view ids] as last stored (for merging membership on lane-only syncs). */
+function getPriorViewMembership() {
+  const map = new Map();
+  for (const r of getDb().prepare(`SELECT atom_issue_id, atom_view_ids FROM issues WHERE atom_view_ids IS NOT NULL`).all()) {
+    const ids = parseViewIds(r.atom_view_ids);
+    if (ids.length) map.set(String(r.atom_issue_id), ids);
+  }
+  return id => map.get(String(id)) || [];
+}
+
+/**
+ * Lane-only syncs: an alert that was not returned by views fetched this run has left them. If it is
+ * still in other (not fetched) views, drop the fetched ones from its membership and re-derive
+ * names / group / family / region. Alerts in fetched views only are handled by purge/resolve.
+ */
+function pruneViewMembership(keepIds, fetchedViewIds) {
+  const db = getDb();
+  const fetched = new Set(fetchedViewIds.map(Number));
+  if (!fetched.size) return 0;
+  const keep = new Set([...keepIds].map(String));
+  const views = new Map(db.prepare(`SELECT id, name, grp, family FROM atom_views`).all().map(v => [v.id, v]));
+  const upd = db.prepare(`UPDATE issues SET atom_view_ids=?, atom_view_names=?, view_group=?, view_family=?, region=? WHERE id=?`);
+  let changed = 0;
+  db.transaction(() => {
+    for (const r of db.prepare(`SELECT id, atom_issue_id, atom_view_ids FROM issues WHERE atom_view_ids IS NOT NULL`).all()) {
+      if (keep.has(String(r.atom_issue_id))) continue;
+      const ids = parseViewIds(r.atom_view_ids);
+      const rest = ids.filter(id => !fetched.has(id));
+      if (rest.length === ids.length || !rest.length) continue;
+      const vs = rest.map(id => views.get(id)).filter(Boolean);
+      const first = vs[0] || {};
+      upd.run(`,${rest.join(',')},`, JSON.stringify(vs.map(v => v.name)), first.grp || null, first.family || null, first.grp || null, r.id);
+      changed++;
+    }
+  })();
+  return changed;
+}
+
 function purgeUntouchedNotIn(keepIds, protectViewIds = []) {
   const db = getDb();
   db.exec(`CREATE TEMP TABLE IF NOT EXISTS _keep_ids (id TEXT PRIMARY KEY)`);
@@ -1082,7 +1194,9 @@ function storeFreshdeskTicket({ atom_issue_id, playlist_id, feed_code, issue_typ
          ticket_type, ticket_url || null, freshdesk_id || null, ticket_type,
          atom_issue_id, playlist_id);
 
-  return db.prepare(`SELECT * FROM freshdesk_tickets WHERE id = last_insert_rowid()`).get();
+  const stored = db.prepare(`SELECT * FROM freshdesk_tickets WHERE id = last_insert_rowid()`).get();
+  if (ticket_type !== 'followup') markLaterVersions(atom_issue_id, playlist_id);
+  return stored;
 }
 
 function getFreshdeskTicketsForIssue(atom_issue_id, playlist_id) {
@@ -1135,5 +1249,7 @@ module.exports = Object.assign(module.exports || {}, {
   getMeta,
   setMeta,
   purgeUntouchedNotIn,
+  getPriorViewMembership,
+  pruneViewMembership,
   prefillCustomerName,
 });

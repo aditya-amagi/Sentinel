@@ -26,7 +26,8 @@ describe('ATOM saved views', () => {
       makeAlert(1, { issue_start_time: recent(1) }),                                  // EMEA Schedule
       makeAlert(2, { issue_start_time: recent(2) }),                                  // EMEA Schedule + APAC Schedule
       makeAlert(3, { issue_start_time: recent(3), type: 'asset_failed' }),            // EMEA Asset
-      makeAlert(4, { issue_start_time: recent(1), type: 'player_rescue_detected_alert' }), // Playout Rescue
+      makeAlert(4, { issue_start_time: recent(1), type: 'player_no_input_stream_alert' }), // Service Alerts
+      makeAlert(7, { issue_start_time: recent(1), type: 'player_rescue_detected_alert' }), // Playout Rescue → not selected
       makeAlert(5, { issue_start_time: recent(1) }),                                  // only in "All CP Alerts" → excluded
       makeAlert(6, { issue_start_time: recent(200) }),                                // EMEA Schedule but older than 72h
     ];
@@ -35,11 +36,12 @@ describe('ATOM saved views', () => {
       { id: 16, name: 'EMEA Schedule Alerts' },
       { id: 17, name: 'EMEA Asset Alerts' },
       { id: 19, name: 'APAC Schedule Alerts' },
+      { id: 37, name: 'Service Alerts' },
       { id: 38, name: 'Playout Rescue' },
       { id: 53, name: 'Bein EMEA Asset' },
       { id: 42, name: 'Live alerts' },
     ];
-    fake.viewMembers = { 1: ['1001', '1002', '1003', '1004', '1005', '1006'], 16: ['1001', '1002', '1006'], 17: ['1003'], 19: ['1002'], 38: ['1004'], 53: [], 42: ['1005'] };
+    fake.viewMembers = { 1: ['1001', '1002', '1003', '1004', '1005', '1006'], 16: ['1001', '1002', '1006'], 17: ['1003'], 19: ['1002'], 37: ['1004'], 38: ['1007'], 53: [], 42: ['1005'] };
     clean();
     Object.assign(process.env, { ATOM_BASE_URL: fake.baseUrl, ATOM_API_KEY: 'k', ATOM_VIEWS: 'auto', ATOM_PAGE_SIZE: '2',
       DB_PATH: TEST_DB, NODE_ENV: 'test', SESSION_SECRET: 'x' });
@@ -60,9 +62,9 @@ describe('ATOM saved views', () => {
     assert.deepEqual(atom.parseViewName('Playout Rescue'), { group: 'Playout Rescue', family: null });
   });
 
-  it('selects region/customer views + Playout Rescue, not catch-alls', () => {
+  it('selects region/customer views + Service Alerts, not catch-alls or Playout Rescue', () => {
     const sel = atom.getViewList().filter(v => v.selected).map(v => v.id).sort((a, b) => a - b);
-    assert.deepEqual(sel, [16, 17, 19, 38, 53]);
+    assert.deepEqual(sel, [16, 17, 19, 37], 'monitored groups + Service Alerts; Bein EMEA not monitored');
   });
 
   it('queries each view with only the filters ATOM allows (no type/entity)', () => {
@@ -82,7 +84,8 @@ describe('ATOM saved views', () => {
     assert.equal(has('1001'), true);
     assert.equal(has('1002'), true);
     assert.equal(has('1003'), true);
-    assert.equal(has('1004'), true, 'Playout Rescue view');
+    assert.equal(has('1004'), true, 'Service Alerts view');
+    assert.equal(has('1007'), false, 'Playout Rescue is not ingested');
     assert.equal(has('1005'), false, 'only in catch-all views');
     assert.equal(has('1006'), false, 'older than the 72h window');
   });
@@ -103,6 +106,21 @@ describe('ATOM saved views', () => {
     assert.equal(emea.views.find(x => x.family === 'Schedule').open, 2);
     assert.equal((await get('/api/issues/upcoming?region=emea&view_family=Asset')).body.map(i => i.atom_issue_id).join(), '1003');
     assert.deepEqual((await get('/api/issues/upcoming?view_id=19')).body.map(i => i.atom_issue_id), ['1002']);
+  });
+
+  it('counts Asset-view alerts as TOC, other types stay in Other', async () => {
+    const ids = q => get(`/api/issues/upcoming?${q}`).then(r => r.body.map(i => i.atom_issue_id).sort());
+    const toc = await ids('toc_only=true');
+    const other = await ids('toc_only=false');
+    assert.ok(toc.includes('1003'), 'asset_failed in EMEA Asset view → TOC');
+    assert.ok(toc.includes('1001') && toc.includes('1002'), 'canonical TOC types');
+    assert.deepEqual(other, ['1004'], 'Service Alerts type is Other');
+    const all = (await get('/api/issues/upcoming')).body;
+    assert.equal(all.find(i => i.atom_issue_id === '1003').is_toc, 1);
+    assert.equal(all.find(i => i.atom_issue_id === '1004').is_toc, 0);
+    const stats = (await get('/api/stats')).body;
+    assert.equal(stats.toc_open, 3);
+    assert.equal(stats.other_open, 1);
   });
 
   it('purges untouched alerts that leave every view, keeps triaged ones', async () => {
@@ -130,5 +148,33 @@ describe('ATOM saved views', () => {
     assert.equal(has('LEGACY-1'), false, 'leftover with no view membership is still reconciled');
     fake.server.removeAllListeners('request');
     fake.server.on('request', orig);
+  });
+
+  it('syncs lanes separately: an Asset-only run leaves Schedule alerts alone', async () => {
+    assert.deepEqual([16, 17, 19, 37, 53].map(id => atom.laneOf(atom.getViewList().find(v => v.id === id))),
+      ['schedule', 'asset', 'schedule', 'other', 'asset']);
+    // Fresh full sync: 1001 in EMEA Schedule, 1003 in EMEA Asset + EMEA Schedule, 1004 in Service Alerts
+    fake.viewMembers = { 1: [], 16: ['1001', '1003'], 17: ['1003'], 19: [], 37: ['1004'], 38: [], 53: [], 42: [] };
+    await sync.triggerSync();
+    const views = id => db.getDb().prepare('SELECT atom_view_ids FROM issues WHERE atom_issue_id=?').get(id)?.atom_view_ids;
+    assert.equal(views('1003'), ',16,17,');
+
+    // Asset lane only; meanwhile 1001 left its Schedule view and 1003 left the Asset view
+    fake.viewMembers[16] = ['1003'];
+    fake.viewMembers[17] = [];
+    fake.requests.length = 0;
+    await sync.triggerSync({ lanes: ['asset'] });
+    const viewIds = fake.requests.filter(r => r.path === '/v1/api/alerts' && r.query.view_id).map(r => r.query.view_id);
+    assert.deepEqual([...new Set(viewIds)].sort(), ['17'], 'only Asset views queried');
+    assert.equal(sync.getSyncStatus().lastSyncStatus, 'success');
+    assert.equal(has('1001'), true, 'Schedule alert untouched until its lane syncs');
+    assert.equal(has('1004'), true, 'Service alert untouched');
+    assert.equal(views('1003'), ',16,', 'left the Asset view, still in Schedule');
+
+    // Schedule lane: now 1001 is reconciled
+    await sync.triggerSync({ lanes: ['schedule'] });
+    assert.equal(has('1001'), false);
+    assert.equal(views('1003'), ',16,');
+    assert.equal(has('1004'), true);
   });
 });

@@ -39,6 +39,10 @@ const API_KEY      = process.env.ATOM_API_KEY      || '';
 const BEARER_TOKEN = process.env.ATOM_BEARER_TOKEN || '';
 const EMAIL        = process.env.ATOM_EMAIL        || '';
 const PASSWORD     = process.env.ATOM_PASSWORD     || '';
+// Automatic token acquisition (SSO refresh-token renewal, email/password login) is OFF by default:
+// Sentinel only uses a service API key or a manually pasted access token, and never fetches or
+// renews a token by itself. Set ATOM_ALLOW_TOKEN_RENEWAL=true to re-enable those modes.
+const ALLOW_RENEWAL = process.env.ATOM_ALLOW_TOKEN_RENEWAL === 'true';
 const REFRESH_TOKEN = process.env.ATOM_REFRESH_TOKEN || '';
 const SESSION_FILE  = process.env.ATOM_SESSION_FILE || path.join(__dirname, '.atom_session.json');
 
@@ -62,7 +66,8 @@ const RAW_TYPES   = (process.env.ATOM_ALERT_TYPES || '').trim();
 const ALERT_TYPES = RAW_TYPES === '*' || RAW_TYPES.toLowerCase() === 'all' ? [] : (RAW_TYPES ? csv(RAW_TYPES) : DEFAULT_ALERT_TYPES);
 // Ingest mode. ATOM saved views (/me/views) carry each team's scope AND ignore rules, so by default
 // Sentinel pulls the alerts present in the region/customer views:
-//   ATOM_VIEWS=auto (default) → views named "<Group> Schedule|Asset|Live [Alerts]" (not "All …") + "Playout Rescue"
+//   ATOM_VIEWS=auto (default) → "<Group> Schedule|Asset|Live [Alerts]" for the groups in ATOM_VIEW_GROUPS
+//                               (default AN1, AN2, AN3, Cloudport Now, America, Enterprise Customer, EMEA, APAC) + "Service Alerts"
 //   ATOM_VIEWS=16,19,31        → exactly these view ids
 //   ATOM_VIEWS=off             → legacy: query by alert type (DEFAULT_ALERT_TYPES) across all of CP
 const VIEWS_SETTING = (process.env.ATOM_VIEWS || 'auto').trim();
@@ -98,10 +103,10 @@ let session = null; // { token, expiresAt } for email/password login
 const authState = { lastRefreshAt: null, lastError: null };
 
 function authMode() {
-  if (API_KEY)            return 'api_key';
-  if (REFRESH_TOKEN)      return 'refresh';
-  if (BEARER_TOKEN)       return 'bearer';
-  if (EMAIL && PASSWORD)  return 'login';
+  if (API_KEY)                              return 'api_key';
+  if (ALLOW_RENEWAL && REFRESH_TOKEN)       return 'refresh';
+  if (BEARER_TOKEN)                         return 'bearer';
+  if (ALLOW_RENEWAL && EMAIL && PASSWORD)   return 'login';
   return 'none';
 }
 
@@ -196,14 +201,18 @@ async function authHeaders() {
       return { Authorization: `Bearer ${fresh ? session.token : await login()}` };
     }
     default:
-      throw new Error('ATOM_BASE_URL is set but no credentials: set ATOM_API_KEY, ATOM_REFRESH_TOKEN, ATOM_BEARER_TOKEN, or ATOM_EMAIL + ATOM_PASSWORD');
+      throw new Error(ALLOW_RENEWAL
+        ? 'ATOM_BASE_URL is set but no credentials: set ATOM_API_KEY, ATOM_REFRESH_TOKEN, ATOM_BEARER_TOKEN, or ATOM_EMAIL + ATOM_PASSWORD'
+        : (REFRESH_TOKEN || (EMAIL && PASSWORD))
+          ? 'ATOM_BASE_URL is set but only a refresh token / login is configured, and automatic token renewal is off — set ATOM_API_KEY (or ATOM_ALLOW_TOKEN_RENEWAL=true)'
+          : 'ATOM_BASE_URL is set but no credentials: set ATOM_API_KEY (or paste an access token into ATOM_BEARER_TOKEN)');
   }
 }
 
 /** Auth status for the UI / sync status (never includes secrets). */
 function authInfo() {
   const mode = authMode();
-  const info = { mode, last_refresh_at: authState.lastRefreshAt, error: authState.lastError };
+  const info = { mode, renewal: ALLOW_RENEWAL, last_refresh_at: authState.lastRefreshAt, error: authState.lastError };
   if (mode === 'refresh' && sso?.expiresAt) info.expires_at = new Date(sso.expiresAt).toISOString();
   if (mode === 'login' && session?.expiresAt) info.expires_at = new Date(session.expiresAt).toISOString();
   if (mode === 'bearer') {
@@ -259,12 +268,30 @@ const alertCache = new Map();
  * @param {function} opts.feedLookup feed_code → atom_feeds row (timezone etc.), optional
  * @returns {{issues: object[], truncated: boolean}}
  */
-async function fetchAlerts({ feedLookup } = {}) {
+/**
+ * Sync lane of a view: "<Group> Asset" → asset, "<Group> Schedule" → schedule, everything else
+ * (Live, Service Alerts, …) → other. Lanes sync on their own intervals (sync.js).
+ */
+function laneOf(view) {
+  const family = view.family !== undefined ? view.family : parseViewName(view.name).family;
+  return family === 'Asset' ? 'asset' : family === 'Schedule' ? 'schedule' : 'other';
+}
+const LANES = ['asset', 'schedule', 'other'];
+
+/**
+ * lanes: subset of LANES to fetch (views mode); null/undefined = all.
+ * priorViews: atom_issue_id → [view ids] it was last seen in (keeps membership of views not
+ * fetched this run).
+ */
+async function fetchAlerts({ feedLookup, lanes, priorViews } = {}) {
   if (DEMO_MODE) return { issues: [], truncated: false };
-  if (!client)   return fetchMock(feedLookup);
+  if (!client)   return fetchMock(feedLookup, lanes, priorViews);
 
   const views = await resolveViews();
-  if (views && views.length) return fetchAlertsByViews(views, feedLookup);
+  if (views && views.length) {
+    const due = lanes ? views.filter(v => lanes.includes(laneOf(v))) : views;
+    return fetchAlertsByViews(due, feedLookup, priorViews);
+  }
   viewMembership = null;
 
   // Production ATOM only supports the singular `state` / `type` filters (staging also has the
@@ -338,11 +365,16 @@ function parseViewName(name) {
   return { group: String(name || '').trim(), family: null };
 }
 
-/** Default selection: region/customer views (not the catch-all "All …" ones) + Playout Rescue. */
+// View groups TOC monitors (their Schedule / Asset / Live views). ATOM_VIEW_GROUPS overrides (comma list).
+const DEFAULT_VIEW_GROUPS = ['AN1', 'AN2', 'AN3', 'Cloudport Now', 'America', 'Enterprise Customer', 'EMEA', 'APAC'];
+const VIEW_GROUPS = new Set((process.env.ATOM_VIEW_GROUPS ? csv(process.env.ATOM_VIEW_GROUPS) : DEFAULT_VIEW_GROUPS)
+  .map(g => g.trim().toLowerCase()));
+
+/** Default selection: the monitored groups' Schedule / Asset / Live views + Service Alerts. */
 function isDefaultView(v) {
   const { group, family } = parseViewName(v.name);
-  if (/^playout rescue$/i.test(String(v.name).trim())) return true;
-  return Boolean(family) && !/^all\b/i.test(group);
+  if (/^(stg-)?service alerts$/i.test(String(v.name).trim())) return true;   // staging: "STG-Service alerts"
+  return Boolean(family) && VIEW_GROUPS.has(group.toLowerCase());
 }
 
 let lastViews = [];          // [{id, name, group, family, selected}]
@@ -372,7 +404,7 @@ async function resolveViews() {
  * Pull every selected view (state by state, newest first), stopping at the lookback cutoff.
  * ATOM rejects other filters with view_id and ignores issue_start_time, so the window is applied here.
  */
-async function fetchAlertsByViews(views, feedLookup) {
+async function fetchAlertsByViews(views, feedLookup, priorViews) {
   const cutoff = LOOKBACK_HOURS > 0 ? Date.now() - LOOKBACK_HOURS * 3600e3 : null;
   const byId = new Map();
   const membership = new Map();
@@ -416,7 +448,8 @@ async function fetchAlertsByViews(views, feedLookup) {
   }));
   if (viewErrors.length) console.warn(`[atom] ${viewErrors.length} view(s) failed: ${viewErrors.join(' · ')}`);
 
-  viewMembership = membership;
+  const fetchedViewIds = views.map(v => v.id).filter(id => !failedViewIds.includes(id));
+  viewMembership = mergePriorMembership(membership, fetchedViewIds, priorViews);
   alertCache.clear();
   const issues = [];
   for (const [id, a] of byId) {
@@ -425,7 +458,24 @@ async function fetchAlertsByViews(views, feedLookup) {
   }
   // `truncated` = a view hit ATOM_MAX_PAGES. Failed views are reported separately: only alerts known
   // to belong to them are protected from purging (sync.js), everything else is still reconciled.
-  return { issues, truncated, mode: 'views', views: views.length, viewErrors, failedViewIds };
+  return { issues, truncated, mode: 'views', views: views.length, viewErrors, failedViewIds, fetchedViewIds };
+}
+
+/**
+ * A run may fetch only some lanes: keep each alert's membership of selected views that were not
+ * fetched successfully this run (from the DB), so an alert in "EMEA Asset" + "EMEA Schedule" keeps
+ * both while only the Asset lane syncs.
+ */
+function mergePriorMembership(membership, fetchedViewIds, priorViews) {
+  if (!priorViews) return membership;
+  const fetched = new Set(fetchedViewIds);
+  const selected = new Set(lastViews.filter(v => v.selected).map(v => v.id));
+  for (const [id, ids] of membership) {
+    for (const vid of priorViews(id) || []) {
+      if (!fetched.has(vid) && selected.has(vid) && !ids.includes(vid)) ids.push(vid);
+    }
+  }
+  return membership;
 }
 
 /** Attach view membership; the first selected view's group becomes the region. */
@@ -447,14 +497,15 @@ function decorateWithViews(iss) {
 const getViewList = () => lastViews.slice();
 
 /** Mock mode: same view selection, lookback, normalisation and view tagging as live — offline data. */
-function fetchMock(feedLookup) {
+function fetchMock(feedLookup, lanes, priorViews) {
   const ids = /^(auto|off)$/i.test(VIEWS_SETTING) ? null : new Set(csv(VIEWS_SETTING).map(String));
-  lastViews = MOCK.VIEWS.map(v => ({ id: v.id, name: v.name, ...parseViewName(v.name),
+  lastViews = MOCK.views().map(v => ({ id: v.id, name: v.name, ...parseViewName(v.name),
     selected: ids ? ids.has(String(v.id)) : isDefaultView(v) }));
-  const selected = new Set(lastViews.filter(v => v.selected).map(v => v.id));
+  const selected = new Set(lastViews.filter(v => v.selected && (!lanes || lanes.includes(laneOf(v)))).map(v => v.id));
   const cutoff = LOOKBACK_HOURS > 0 ? Date.now() - LOOKBACK_HOURS * 3600e3 : null;
   const { alerts, membership } = MOCK.generate();
   viewMembership = new Map();
+  const fetchedViewIds = [...selected];
   alertCache.clear();
   const issues = [];
   for (const a of alerts) {
@@ -462,11 +513,15 @@ function fetchMock(feedLookup) {
     if (!inViews.length) continue;
     const t = Date.parse(a.issue_start_time);
     if (cutoff && Number.isFinite(t) && t < cutoff) continue;
-    viewMembership.set(a.alert_id, inViews);
+    viewMembership.set(a.alert_id, [...inViews]);
+  }
+  mergePriorMembership(viewMembership, fetchedViewIds, priorViews);
+  for (const a of alerts) {
+    if (!viewMembership.has(a.alert_id)) continue;
     alertCache.set(a.alert_id, a);
     issues.push(decorateWithViews(normalizeAlert(a, feedLookup)));
   }
-  return { issues, truncated: false, mode: 'views', views: selected.size, viewErrors: [], failedViewIds: [] };
+  return { issues, truncated: false, mode: 'views', views: selected.size, viewErrors: [], failedViewIds: [], fetchedViewIds };
 }
 
 /** Backward-compatible: issues only. */
@@ -519,7 +574,8 @@ function markForbidden(key, err) {
  */
 async function getPlaylistTimeline(feed_code, playlist_date, region, automation_url) {
   if (DEMO_MODE) return [];
-  if (!client)   return mockTimeline(feed_code, playlist_date, region);   // deterministic per feed/date
+  // Replaying a prod snapshot: prod returned 403 for playlists (operator role) → no versions, like prod
+  if (!client)   return [];   // mock: versions are derived from the alerts' playlist ids (db.recordVersionsFromAlerts)
 
   automation_url = automation_url || automationUrlByFeed.get(feed_code);
   if (!feed_code || !playlist_date || !automation_url || isForbidden('published_playlist')) return [];
@@ -545,6 +601,10 @@ async function getPlaylistTimeline(feed_code, playlist_date, region, automation_
  * Returns null when no playlist is published. Demo/mock modes return a synthetic playlist.
  */
 async function getPlaylist(automation_url, feed_code, playlist_date) {
+  if (IS_MOCK && MOCK.isReplay()) {
+    // Same as prod at capture time: the operator role may not read playlists
+    const e = new Error('Your ATOM role is not allowed to read playlists (403)'); e.status = 403; throw e;
+  }
   if (!IS_LIVE) return mockPlaylist(feed_code, playlist_date);
   if (!automation_url || !feed_code || !playlist_date) return null;
   if (isForbidden('feed_playlist')) {
@@ -720,19 +780,6 @@ function regionFromCloud(r) {
 // ── Offline helpers (mock mode; realistic alerts come from atomMock.js) ──────────
 
 
-function mockTimeline(feed_code, playlist_date, region) {
-  if (!feed_code || !playlist_date) return [];
-  let h = [...`${feed_code}|${playlist_date}`].reduce((x, c) => (x * 31 + c.charCodeAt(0)) >>> 0, 17);
-  const base = 230000 + (h % 9999), n = 1 + (h % 3);
-  const day = Date.parse(`${playlist_date}T06:00:00Z`);
-  if (!Number.isFinite(day)) return [];
-  return Array.from({ length: n }, (_, i) => ({
-    feed_code, playlist_date, region,
-    playlist_id: String(base + i * 37),
-    published_at: new Date(day - (n - i) * 5 * 3600e3).toISOString(),
-  }));
-}
-
 /** Deterministic synthetic playlist: 30-minute items across the day (demo/mock only). */
 function mockPlaylist(feed_code, playlist_date) {
   if (!feed_code || !playlist_date) return null;
@@ -776,6 +823,8 @@ module.exports = {
   isPaused: () => guard.isPaused(),
   getViewList,
   parseViewName,
+  laneOf,
+  LANES,
   viewsMode: () => !/^off$/i.test(VIEWS_SETTING),
   queryPlan,
   DEFAULT_ALERT_TYPES,

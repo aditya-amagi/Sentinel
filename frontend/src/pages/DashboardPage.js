@@ -5,7 +5,8 @@ import IssueDetail from '../components/IssueDetail';
 import FilterBar, { DEFAULT_FILTERS } from '../components/FilterBar';
 import KpiStrip    from '../components/KpiStrip';
 import { setSREContext, SREBus } from '../components/SRETerminal';
-import { isToc, severityRank, triageOf, SEVERITIES } from '../lib/alerts';
+import { toBuckets } from '../lib/buckets';
+import { isTocIssue, severityRank, triageOf, SEVERITIES } from '../lib/alerts';
 import './DashboardPage.css';
 
 const TRIAGE_ORDER = { penalty: 0, ack: 1, ticketed: 2 };
@@ -69,22 +70,23 @@ export default function DashboardPage({ region, family, onStatsChange, stats }) 
     onStatsChange();
   }, [onStatsChange]);
 
-  const { toc, other } = useMemo(() => {
+  const { toc, other, tocBuckets, otherBuckets } = useMemo(() => {
     const sorter = SORTERS[filters.sort] || SORTERS.priority;
     const t = [], o = [];
-    for (const i of issues) (isToc(i.issue_type) ? t : o).push(i);
-    return { toc: t.sort(sorter), other: o.sort(sorter) };
+    for (const i of issues) (isTocIssue(i) ? t : o).push(i);
+    t.sort(sorter); o.sort(sorter);
+    return { toc: t, other: o, tocBuckets: toBuckets(t), otherBuckets: toBuckets(o) };
   }, [issues, filters.sort]);
 
   const scope = filters.toc_only; // '' both | 'true' TOC only | 'false' other only
   const sections = [
-    scope !== 'false' && { key: 'toc',   title: 'TOC alerts',        hint: 'Hole · No playlist · Duration mismatch · Missing in cloud', rows: toc },
-    scope !== 'true'  && { key: 'other', title: 'Other ATOM alerts', hint: 'Every other ATOM alert type on these feeds',                rows: other },
+    scope !== 'false' && { key: 'toc',   title: 'TOC alerts',        hint: 'Hole · No playlist · Duration mismatch · Missing in cloud · Asset view alerts', rows: toc, buckets: tocBuckets },
+    scope !== 'true'  && { key: 'other', title: 'Other ATOM alerts', hint: 'Every other ATOM alert type on these feeds',                rows: other, buckets: otherBuckets },
   ].filter(Boolean);
 
-  const view = rows => viewMode === 'table'
-    ? <IssueTable issues={rows} loading={false} selectedKey={selectedKey} onSelect={setSelectedKey} onStateChange={mergeIssue} />
-    : <AlertGroups issues={rows} selectedKey={selectedKey} onSelect={setSelectedKey} onStateChange={mergeIssue} />;
+  const view = buckets => viewMode === 'table'
+    ? <IssueTable buckets={buckets} selectedKey={selectedKey} onSelect={setSelectedKey} onStateChange={mergeIssue} />
+    : <AlertGroups buckets={buckets} selectedKey={selectedKey} onSelect={setSelectedKey} onStateChange={mergeIssue} />;
 
   return (
     <div className="dashboard-page">
@@ -103,20 +105,23 @@ export default function DashboardPage({ region, family, onStatsChange, stats }) 
                 <span className={`section-chevron ${collapsed[sec.key] ? '' : 'open'}`}>›</span>
                 <span className="section-title">{sec.title}</span>
                 <span className="section-count">{sec.rows.length}</span>
+                {sec.buckets.length < sec.rows.length && (
+                  <span className="section-buckets" title="ATOM groups repeated alerts for the same problem into buckets">{sec.buckets.length} buckets</span>
+                )}
                 <SeverityMini rows={sec.rows} />
                 <span className="section-hint">{sec.hint}</span>
               </button>
               {!collapsed[sec.key] && (
                 sec.rows.length
                   ? <div className="section-body">
-                      {view(sec.rows.slice(0, shown[sec.key]))}
-                      {sec.rows.length > shown[sec.key] && (
+                      {view(sec.buckets.slice(0, shown[sec.key]))}
+                      {sec.buckets.length > shown[sec.key] && (
                         <div className="section-more">
-                          <span>Showing {shown[sec.key]} of {sec.rows.length}</span>
+                          <span>Showing {shown[sec.key]} of {sec.buckets.length} rows</span>
                           <button className="btn sm" onClick={() => setShown(s => ({ ...s, [sec.key]: s[sec.key] + PAGE }))}>
-                            Show {Math.min(PAGE, sec.rows.length - shown[sec.key])} more
+                            Show {Math.min(PAGE, sec.buckets.length - shown[sec.key])} more
                           </button>
-                          <button className="btn ghost sm" onClick={() => setShown(s => ({ ...s, [sec.key]: sec.rows.length }))}>Show all</button>
+                          <button className="btn ghost sm" onClick={() => setShown(s => ({ ...s, [sec.key]: sec.buckets.length }))}>Show all</button>
                         </div>
                       )}
                     </div>

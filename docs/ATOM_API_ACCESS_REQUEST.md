@@ -86,13 +86,13 @@ In the first production sync, the monitoring filter removed about 15% of alerts 
 
 ## 5. Expected load
 
-Sentinel pulls the alerts in TOC's **saved ATOM views** (`GET /alerts?view_id=…&state=…`): the region/customer Schedule, Asset and Live views plus Playout Rescue, 26 views in all. Load is capped on Sentinel's side:
+Sentinel pulls the alerts in TOC's **saved ATOM views** (`GET /alerts?view_id=…&state=…`): the region/customer Schedule, Asset and Live views plus Service Alerts, 26 views in all. Load is capped on Sentinel's side:
 
 | Guardrail | Value |
 |---|---|
 | Max requests per rolling minute (all endpoints, incl. token refresh) | **20** |
 | Requests in flight at once | **1** |
-| Sync interval | every **10 min**; a server restart doesn't trigger an extra sync |
+| Sync interval | Asset views every **15 min**, Schedule views every **30 min**, Live / Service Alerts every **15 min**; a server restart doesn't trigger an extra sync |
 | Circuit breaker | after 3 timeouts/5xx in a row, or any 429, Sentinel **stops calling ATOM** for 2 → 4 → … → 30 min and honours `Retry-After` |
 
 | Call | Per sync | Per day (typical) |

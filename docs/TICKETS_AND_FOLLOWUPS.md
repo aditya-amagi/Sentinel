@@ -58,7 +58,7 @@ Change the wording in `COPY` inside `ticketText.js`. Tests in `tests/ticketText.
 
 - **Subject**: `TOC Alert [AM3] : {friendly type} - {channel name} ({feed}) - {broadcast date}`. Without a known channel name, it's just `{feed}`.
 - **Priority** (Freshdesk 1–4): blocker/critical → 4, major → 3, minor → 2, dev → 1, unknown → 2. **Raised to 4** when the first affected time is on-air now or within 2 hours. The preview shows the reason, for example "Urgent — airs within 2 hours".
-- **One ticket, all related alerts**: a ticket covers every **open, not-yet-ticketed** alert of the same type, feed and broadcast date (`getRelatedOpenAlerts`, up to 50). The preview shows "Covers N alerts". All covered alerts are stored against the ticket and become **Ticketed**. With ATOM write-back on, each covered ATOM alert gets the ticket comment.
+- **One ticket, all related alerts**: a ticket covers every **open, not-yet-ticketed** alert of the same type, feed and broadcast date (`getRelatedOpenAlerts`, up to 50), **plus every open alert in the same ATOM bucket** (`correlation_id`). The dashboard groups each bucket into one expandable row; ticketing from any alert in it covers the whole bucket. The preview shows "Covers N alerts". All covered alerts are stored against the ticket and become **Ticketed**. With ATOM write-back on, each covered ATOM alert gets the ticket comment.
 - **Ticketed state**: creating a ticket now moves the issue to `ticketed`. Before Nov 2026 this never happened, so the Ticketed state was never reached.
 - **Mock mode**: without `FRESHDESK_DOMAIN`/`FRESHDESK_API_KEY`, tickets are `INC-10001…` and nothing is sent.
 
