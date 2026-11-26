@@ -108,6 +108,16 @@ describe('ATOM saved views', () => {
     assert.deepEqual((await get('/api/issues/upcoming?view_id=19')).body.map(i => i.atom_issue_id), ['1002']);
   });
 
+  it('opens alerts without a playlist ("-" in the URL stands for an empty playlist_id)', async () => {
+    db.upsertIssue({ atom_issue_id: 'NP-1', playlist_id: '', raw_type: 'no_published_playlist', issue_type: 'NO_PLAYLIST', feed_code: 'NPF' });
+    const r = await get('/api/issues/NP-1/playlist/-');
+    assert.equal(r.status, 200);
+    assert.equal(r.body.issue.atom_issue_id, 'NP-1');
+    assert.equal(r.body.issue.playlist_id, '');
+    assert.equal((await get('/api/issues/NP-1/playlist/-/snooze-options')).status, 200);
+    db.getDb().prepare("DELETE FROM issues WHERE atom_issue_id='NP-1'").run();
+  });
+
   it('counts Asset-view alerts as TOC, other types stay in Other', async () => {
     const ids = q => get(`/api/issues/upcoming?${q}`).then(r => r.body.map(i => i.atom_issue_id).sort());
     const toc = await ids('toc_only=true');

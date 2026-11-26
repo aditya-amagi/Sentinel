@@ -22,8 +22,12 @@ export async function api(path, { method = 'GET', body, log = true } = {}) {
   return data;
 }
 
+// Alerts without a playlist (No Playlist, live/ingest faults) have playlist_id '' — an empty URL
+// segment would not match the route, so it travels as "-" (server.js maps it back).
+export const playlistSeg = id => (id === null || id === undefined || id === '' ? '-' : encodeURIComponent(id));
+
 export const issuePath = (issue, suffix = '') =>
-  `/api/issues/${encodeURIComponent(issue.atom_issue_id)}/playlist/${encodeURIComponent(issue.playlist_id)}${suffix}`;
+  `/api/issues/${encodeURIComponent(issue.atom_issue_id)}/playlist/${playlistSeg(issue.playlist_id)}${suffix}`;
 
 /** Change triage state; optional snooze_until mirrors an Ack into ATOM as a snooze. */
 export async function setTriageState(issue, state, snooze_until) {

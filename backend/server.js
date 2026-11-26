@@ -45,6 +45,8 @@ app.use(cors({
   credentials: true,
 }));
 app.use(express.json());
+// Alerts without a playlist have playlist_id '' — clients send "-" for it in URLs
+app.param('playlistId', (req, _res, next, v) => { if (v === '-') req.params.playlistId = ''; next(); });
 
 // ── Session ───────────────────────────────────────────────────────────────────
 app.use(session({

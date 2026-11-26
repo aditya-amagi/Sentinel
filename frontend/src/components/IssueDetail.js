@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import TicketModal from './TicketModal';
 import AckButton from './AckButton';
 import { SeverityPill, AtomStatePill, TriagePill, TypeLabel } from './Pills';
-import { api, issuePath } from '../lib/api';
+import { api, issuePath, playlistSeg } from '../lib/api';
 import { triageOf, fmtLong, fmtShort, fmtClock, fmtInZone, fmtDuration, relTime, isTocIssue } from '../lib/alerts';
 import './IssueDetail.css';
 
@@ -20,9 +20,9 @@ export default function IssueDetail({ atomIssueId, playlistId, onClose, onUpdate
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const json = await api(`/api/issues/${encodeURIComponent(atomIssueId)}/playlist/${encodeURIComponent(playlistId)}`, { log: false });
+      const json = await api(`/api/issues/${encodeURIComponent(atomIssueId)}/playlist/${playlistSeg(playlistId)}`, { log: false });
       setData(json);
-      api(`/api/freshdesk/tickets/${encodeURIComponent(atomIssueId)}/${encodeURIComponent(playlistId)}`, { log: false })
+      api(`/api/freshdesk/tickets/${encodeURIComponent(atomIssueId)}/${playlistSeg(playlistId)}`, { log: false })
         .then(t => setFd(Array.isArray(t) ? t : [])).catch(() => setFd([]));
       if (json.issue?.feed_code) {
         api(`/api/atom/feeds/${encodeURIComponent(json.issue.feed_code)}`, { log: false }).then(setFeed).catch(() => setFeed(null));
